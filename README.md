@@ -22,7 +22,7 @@
 ## 📸 Скриншоты
 
 ### Главная страница
-<img width="647" alt="Снимок экрана 2025-06-05 в 17 03 22" src="https://github.com/user-attachments/assets/3927bd78-a474-4266-ba8b-71905bb2783f" />
+<img width="630" alt="Снимок экрана 2025-06-05 в 17 03 22" src="https://github.com/user-attachments/assets/3927bd78-a474-4266-ba8b-71905bb2783f" />
 
 ### Просмотр файла
 <img width="630" alt="Снимок экрана 2025-06-05 в 17 10 11" src="https://github.com/user-attachments/assets/3b812a40-7867-4749-8503-ecff82643e91" />
