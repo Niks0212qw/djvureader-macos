@@ -51,7 +51,7 @@ macOS покажет предупреждение безопасности, та
 ```bash
 sudo xattr -r -c /Applications/Converter_mac.app
 ```
-5. Снова откройте приложение 
+4. Снова откройте приложение 
 
 ### Установка DjVuLibre для DJVU файлов
 
