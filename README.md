@@ -1,188 +1,188 @@
 # DJVU Reader macOS
 
-Современный просмотрщик DJVU и PDF документов для macOS с поддержкой двух режимов просмотра и продвинутым кэшированием.
+A modern DJVU and PDF document viewer for macOS with dual viewing modes and advanced caching.
 
-## Особенности
+## Features
 
-- 📚 Поддержка форматов DJVU, DJV и PDF
-- 🔄 Два режима просмотра: постраничный и непрерывный
-- 🔍 Плавное масштабирование с сохранением позиции
-- ⚡ Интеллектуальное кэширование и предзагрузка страниц
-- ⌨️ Полная поддержка клавиатурных сокращений
-- 👆 Жесты и свайпы для навигации
-- 🎨 Современный нативный интерфейс macOS
-- 🌙 Поддержка темной темы
-- 🖱️ Drag & Drop поддержка
+- 📚 Support for DJVU, DJV, and PDF formats
+- 🔄 Two viewing modes: page-by-page and continuous
+- 🔍 Smooth zooming with position preservation
+- ⚡ Intelligent caching and page preloading
+- ⌨️ Full keyboard shortcuts support
+- 👆 Gestures and swipes for navigation
+- 🎨 Modern native macOS interface
+- 🌙 Dark theme support
+- 🖱️ Drag & Drop support
 
-## Поддерживаемые форматы
+## Supported Formats
 
-- 📖 **DJVU/DJV** - электронные книги и отсканированные документы
-- 📄 **PDF** - портативные документы (встроенная поддержка)
+- 📖 **DJVU/DJV** - e-books and scanned documents
+- 📄 **PDF** - portable documents (built-in support)
 
-## 📸 Скриншоты
+## 📸 Screenshots
 
-### Главная страница
-<img width="630" alt="Снимок экрана 2025-06-05 в 17 03 22" src="https://github.com/user-attachments/assets/3927bd78-a474-4266-ba8b-71905bb2783f" />
+### Main Page
+<img width="630" alt="Screenshot 2025-06-05 at 17 03 22" src="https://github.com/user-attachments/assets/3927bd78-a474-4266-ba8b-71905bb2783f" />
 
-### Просмотр файла
-<img width="630" alt="Снимок экрана 2025-06-05 в 17 10 11" src="https://github.com/user-attachments/assets/3b812a40-7867-4749-8503-ecff82643e91" />
+### File Viewer
+<img width="630" alt="Screenshot 2025-06-05 at 17 10 11" src="https://github.com/user-attachments/assets/3b812a40-7867-4749-8503-ecff82643e91" />
 
-## 📥 Установка готового приложения
+## 📥 Installing the Ready-Made Application
 
-### Скачать готовое приложение
-1. Перейдите на [страницу релизов](https://github.com/username/djvu-reader/releases)
-2. Скачайте файл `DJVUReader.dmg` или `DJVUReader.zip` из последней версии
-3. Откройте скачанный файл и переместите `DJVU Reader.app` в папку **Applications**
+### Download the Ready-Made Application
+1. Go to the [releases page](https://github.com/username/djvu-reader/releases)
+2. Download the `DJVUReader.dmg` or `DJVUReader.zip` file from the latest version
+3. Open the downloaded file and move `DJVU Reader.app` to the **Applications** folder
 
-### ⚠️ Первый запуск (важно!)
+### ⚠️ First Launch (Important!)
 
-macOS покажет предупреждение безопасности, так как приложение создано независимым разработчиком. **Это нормально!**
+macOS will show a security warning since the application is created by an independent developer. **This is normal!**
 
-#### Правильный способ первого запуска:
-1. **Правый клик** на `DJVU Reader.app` в папке Applications
-2. Выберите **"Открыть"** из контекстного меню
-3. В появившемся диалоге нажмите **"Открыть"**
-4. Приложение запустится и больше не будет показывать предупреждений
+#### Correct Way to Launch for the First Time:
+1. **Right-click** on `DJVU Reader.app` in the Applications folder
+2. Select **"Open"** from the context menu
+3. In the dialog that appears, click **"Open"**
+4. The application will launch and won't show warnings anymore
 
-#### Альтернативный способ:
-1. Попробуйте запустить приложение обычным способом
-2. Появится предупреждение - нажмите **"Отмена"**
-3. После перетаскивания приложения в папку **"Программы"** выполните в терминале данную команду
+#### Alternative Method:
+1. Try to launch the application normally
+2. A warning will appear - click **"Cancel"**
+3. After dragging the application to the **"Applications"** folder, run this command in Terminal:
 ```bash
 sudo xattr -r -c /Applications/DJVUReader.app
 ```
-4. Снова откройте приложение 
+4. Open the application again
 
-### Установка DjVuLibre для DJVU файлов
+### Installing DjVuLibre for DJVU Files
 
-Для работы с DJVU файлами необходимо установить DjVuLibre через Homebrew:
+To work with DJVU files, you need to install DjVuLibre via Homebrew:
 
 ```bash
 brew install djvulibre
 ```
 
-*Примечание: PDF файлы работают без дополнительных библиотек*
+*Note: PDF files work without additional libraries*
 
-## 🛠 Сборка из исходного кода
+## 🛠 Building from Source Code
 
-Если хотите собрать приложение самостоятельно:
+If you want to build the application yourself:
 
-### Системные требования для сборки
-- macOS 12.0 или выше
-- Xcode 14.0 или выше
-- Swift 5.7 или выше
+### System Requirements for Building
+- macOS 12.0 or higher
+- Xcode 14.0 or higher
+- Swift 5.7 or higher
 
-### Инструкции по сборке
-1. Клонируйте репозиторий:
+### Build Instructions
+1. Clone the repository:
 ```bash
 git clone https://github.com/username/djvu-reader.git
 cd djvu-reader
 ```
 
-2. Откройте проект в Xcode:
+2. Open the project in Xcode:
 ```bash
 open DJVUReader.xcodeproj
 ```
 
-3. Соберите и запустите проект (⌘+R)
+3. Build and run the project (⌘+R)
 
-## Использование
+## Usage
 
-### Основные функции
+### Main Functions
 
-- **Открытие документов**: Перетащите файл в окно или используйте меню "Файл" → "Открыть"
-- **Режимы просмотра**: Переключайтесь между постраничным и непрерывным режимом
-- **Масштабирование**: Используйте жесты, колесо мыши или клавиатурные сокращения
-- **Навигация**: Переходите между страницами свайпами, стрелками или меню
+- **Opening Documents**: Drag a file into the window or use "File" → "Open" menu
+- **Viewing Modes**: Switch between page-by-page and continuous mode
+- **Zooming**: Use gestures, mouse wheel, or keyboard shortcuts
+- **Navigation**: Navigate between pages with swipes, arrows, or menu
 
-### ⌨️ Горячие клавиши
+### ⌨️ Keyboard Shortcuts
 
-#### Навигация
-- `←` / `→` - Предыдущая/следующая страница (постраничный режим)
-- `↑` / `↓` - Предыдущая/следующая страница (непрерывный режим)
-- `Пробел` - Следующая страница
-- `Home` - Первая страница
-- `End` - Последняя страница
+#### Navigation
+- `←` / `→` - Previous/next page (page-by-page mode)
+- `↑` / `↓` - Previous/next page (continuous mode)
+- `Space` - Next page
+- `Home` - First page
+- `End` - Last page
 
-#### Масштабирование
-- `⌘+` - Увеличить
-- `⌘-` - Уменьшить
-- `⌘0` - Реальный размер
+#### Zooming
+- `⌘+` - Zoom in
+- `⌘-` - Zoom out
+- `⌘0` - Actual size
 
-#### Режимы просмотра
-- `⌘1` - Постраничный режим
-- `⌘2` - Непрерывный режим
+#### Viewing Modes
+- `⌘1` - Page-by-page mode
+- `⌘2` - Continuous mode
 
-#### Файлы
-- `⌘O` - Открыть документ
+#### Files
+- `⌘O` - Open document
 
-### Жесты и взаимодействие
+### Gestures and Interaction
 
-- **Pinch-to-zoom** - Масштабирование жестами
-- **Двойной тап** - Быстрое масштабирование
-- **Панорамирование** - Перемещение при увеличении
-- **Свайпы** - Смена страниц в постраничном режиме
+- **Pinch-to-zoom** - Zoom with gestures
+- **Double tap** - Quick zoom
+- **Panning** - Move when zoomed in
+- **Swipes** - Change pages in page-by-page mode
 
-## Архитектура
+## Architecture
 
-Проект построен с использованием:
+The project is built using:
 
-- **SwiftUI** - для современного пользовательского интерфейса
-- **Combine** - для реактивного программирования
-- **PDFKit** - для работы с PDF документами
-- **Process/Shell** - для взаимодействия с DjVuLibre
-- **MVVM** - архитектурный паттерн
+- **SwiftUI** - for modern user interface
+- **Combine** - for reactive programming
+- **PDFKit** - for working with PDF documents
+- **Process/Shell** - for interaction with DjVuLibre
+- **MVVM** - architectural pattern
 
-### Структура проекта
+### Project Structure
 
 ```
 DJVUReader/
 ├── Views/
-│   ├── ContentView.swift           # Главный экран приложения
-│   ├── DocumentView.swift          # Постраничный просмотр
-│   ├── ContinuousDocumentView.swift # Непрерывный просмотр
-│   └── WelcomeView.swift          # Экран приветствия
+│   ├── ContentView.swift           # Main application screen
+│   ├── DocumentView.swift          # Page-by-page viewer
+│   ├── ContinuousDocumentView.swift # Continuous viewer
+│   └── WelcomeView.swift          # Welcome screen
 ├── Models/
-│   └── DJVUDocument.swift         # Основная модель документа
+│   └── DJVUDocument.swift         # Main document model
 ├── App/
-│   └── DJvuReaderApp.swift        # Точка входа и меню
+│   └── DJvuReaderApp.swift        # Entry point and menu
 ├── Utilities/
-│   └── Extensions+Utilities.swift  # Вспомогательные расширения
+│   └── Extensions+Utilities.swift  # Helper extensions
 └── Resources/
-    └── Assets.xcassets            # Ресурсы и иконки
+    └── Assets.xcassets            # Resources and icons
 ```
 
-### Ключевые особенности реализации
+### Key Implementation Features
 
-- **Асинхронная загрузка** страниц в фоновом режиме
-- **Многоуровневое кэширование** (отображение, предзагрузка, миниатюры)
-- **Обработка русских имен файлов** через временные копии
-- **Оптимизация памяти** с автоматической очисткой кэша
-- **Адаптивный интерфейс** для разных размеров экрана
+- **Asynchronous loading** of pages in background
+- **Multi-level caching** (display, preload, thumbnails)
+- **Russian filename handling** via temporary copies
+- **Memory optimization** with automatic cache cleanup
+- **Adaptive interface** for different screen sizes
 
-## Технические детали
+## Technical Details
 
-### Обработка DJVU файлов
-Использует системные утилиты DjVuLibre:
-- `djvused` - для определения количества страниц
-- `ddjvu` - для конвертации страниц в растровые форматы
+### DJVU File Processing
+Uses DjVuLibre system utilities:
+- `djvused` - for determining page count
+- `ddjvu` - for converting pages to raster formats
 
-### Кэширование
-- **Основной кэш**: Страницы высокого разрешения (scale=400-500)
-- **Кэш миниатюр**: Превью страниц для быстрой навигации
-- **Непрерывный кэш**: Специальный кэш для режима непрерывного просмотра
-- **Автоочистка**: При превышении лимита памяти
+### Caching
+- **Main Cache**: High-resolution pages (scale=400-500)
+- **Thumbnail Cache**: Page previews for quick navigation
+- **Continuous Cache**: Special cache for continuous viewing mode
+- **Auto-cleanup**: When memory limit is exceeded
 
-### Производительность
-- Предзагрузка соседних страниц
-- Фоновая загрузка всего документа
-- Оптимизированный рендеринг с высоким DPI
-- Плавные анимации переходов
+### Performance
+- Preloading of adjacent pages
+- Background loading of entire document
+- Optimized rendering with high DPI
+- Smooth transition animations
 
-## 📝 Лицензия
+## 📝 License
 
-Этот проект распространяется под лицензией MIT. Подробности в файле `LICENSE`.
+This project is distributed under the MIT License. Details in the `LICENSE` file.
 
-## Автор
+## Author
 
 Nikita Krivonosov - nikskrivonosovv@gmail.com
