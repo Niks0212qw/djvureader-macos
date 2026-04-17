@@ -253,31 +253,16 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Режим непрерывного просмотра с исправленной логикой масштабирования
+// MARK: - Непрерывный режим на AppKit-скролле как в DjVu Reader Pro
 struct ContinuousDocumentView: View {
     @ObservedObject var djvuDocument: DJVUDocument
     @Binding var zoomLevel: Double
-    @State private var lastZoomLevel: Double = 1.0
-    @State private var scrollOffset: CGPoint = .zero
-    @State private var zoomAnchor: UnitPoint = .center
-    @State private var gestureLocation: CGPoint = .zero
-    @State private var viewportSize: CGSize = .zero
     @State private var keyboardZoomObserver: NSObjectProtocol?
     @State private var keyboardResetObserver: NSObjectProtocol?
-    @State private var scrollProxy: ScrollViewProxy?
-    
-    // Переменные для правильного зумирования с сохранением позиции
-    @State private var contentSize: CGSize = .zero
-    @State private var isPerformingZoom: Bool = false
-    @State private var zoomCenterPoint: CGPoint = .zero
-    @State private var scrollReader: ScrollViewProxy?
-    @State private var currentScrollOffset: CGFloat = 0 // Текущий компенсирующий offset
-    @State private var savedPagePosition: CGFloat = 0 // Сохраненная позиция внутри страницы (0.0 - 1.0)
-    
+
     var body: some View {
         GeometryReader { geometry in
             ZStack {
-                // Фон
                 LinearGradient(
                     colors: [
                         Color(NSColor.controlBackgroundColor),
@@ -287,41 +272,22 @@ struct ContinuousDocumentView: View {
                     endPoint: .bottomTrailing
                 )
                 .ignoresSafeArea()
-                
-                // Основное содержимое
-                Group {
-                    if djvuDocument.continuousImages.isEmpty {
-                        if djvuDocument.isContinuousLoading {
-                            loadingView
-                        } else {
-                            placeholderView
-                        }
-                    } else {
-                        continuousContentView(geometry: geometry)
-                    }
-                }
-            }
-            .onAppear {
-                viewportSize = geometry.size
-            }
-            .onChange(of: geometry.size) { newSize in
-                viewportSize = newSize
+
+                ContinuousScrollViewRepresentable(
+                    djvuDocument: djvuDocument,
+                    zoomLevel: $zoomLevel,
+                    viewportSize: geometry.size
+                )
             }
         }
         .onAppear {
-            print("📱 ContinuousDocumentView появился на экране")
-            print("📊 continuousImages содержит: \(djvuDocument.continuousImages.count) страниц")
             setupKeyboardZoomObservers()
         }
         .onDisappear {
             removeKeyboardZoomObservers()
         }
-        .onChange(of: djvuDocument.continuousImages.count) { count in
-            print("🔔 continuousImages изменился: теперь \(count) страниц")
-        }
     }
-    
-    // MARK: - Обработка команд зума с клавиатуры (исправлено для центрирования)
+
     private func setupKeyboardZoomObservers() {
         keyboardZoomObserver = NotificationCenter.default.addObserver(
             forName: .keyboardZoomChange,
@@ -329,21 +295,18 @@ struct ContinuousDocumentView: View {
             queue: .main
         ) { notification in
             guard let delta = notification.userInfo?["delta"] as? Double else { return }
-            // Для клавиатурного зума используем центр экрана как точку фокуса
-            let centerPoint = CGPoint(x: viewportSize.width / 2, y: viewportSize.height / 2)
-            performZoomWithFocus(delta: delta, focusPoint: centerPoint, animated: true)
+            zoomLevel = max(0.5, min(3.0, zoomLevel + delta))
         }
-        
+
         keyboardResetObserver = NotificationCenter.default.addObserver(
             forName: .keyboardZoomReset,
             object: nil,
             queue: .main
         ) { _ in
-            let centerPoint = CGPoint(x: viewportSize.width / 2, y: viewportSize.height / 2)
-            resetZoomWithFocus(focusPoint: centerPoint, animated: true)
+            zoomLevel = 1.0
         }
     }
-    
+
     private func removeKeyboardZoomObservers() {
         if let observer = keyboardZoomObserver {
             NotificationCenter.default.removeObserver(observer)
@@ -352,381 +315,431 @@ struct ContinuousDocumentView: View {
             NotificationCenter.default.removeObserver(observer)
         }
     }
-    
-    // MARK: - Определение текущей страницы и позиции
-    
-    /// - Returns: (индекс страницы, относительная позиция внутри страницы 0.0-1.0, Y-координата начала страницы)
-    private func getCurrentPageInfo() -> (pageIndex: Int, relativePosition: CGFloat, pageStartY: CGFloat) {
-        let scrollY = -scrollOffset.y
-        let adjustedScrollY = max(0, scrollY)
-        
-        let estimatedPageHeight = viewportSize.height * 0.75 * zoomLevel + 8
-        
-        let currentPageIndex = max(0, min(djvuDocument.totalPages - 1, Int(adjustedScrollY / estimatedPageHeight)))
-        let pageStartY = CGFloat(currentPageIndex) * estimatedPageHeight
-        let positionInPage = (adjustedScrollY - pageStartY) / estimatedPageHeight
-        let clampedPosition = max(0, min(1, positionInPage))
-        
-        print("📍 Текущая страница: \(currentPageIndex + 1), позиция в странице: \(String(format: "%.2f", clampedPosition))")
-        
-        return (currentPageIndex, clampedPosition, pageStartY)
+}
+
+private struct ContinuousScrollViewRepresentable: NSViewRepresentable {
+    @ObservedObject var djvuDocument: DJVUDocument
+    @Binding var zoomLevel: Double
+    let viewportSize: CGSize
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
     }
 
-    /// - Parameters:
-    ///   - pageIndex: Индекс страницы (0-based)
-    ///   - zoom: Масштаб для вычисления
-    /// - Returns: Y-координата центра страницы в координатах контента
-    private func calculatePageCenterY(for pageIndex: Int, zoom: Double) -> CGFloat {
-        let estimatedPageHeight = viewportSize.height * 0.75 * zoom + 8
-        let pageStartY = CGFloat(pageIndex) * estimatedPageHeight
-        let pageCenterY = pageStartY + (estimatedPageHeight - 8) / 2 // Вычитаем padding
-        return pageCenterY
+    func makeNSView(context: Context) -> ContinuousHostingScrollView {
+        let scrollView = ContinuousHostingScrollView()
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
+        scrollView.autohidesScrollers = false
+        scrollView.scrollerStyle = .overlay
+        scrollView.allowsMagnification = true
+        scrollView.minMagnification = 0.5
+        scrollView.maxMagnification = 3.0
+        scrollView.magnification = CGFloat(max(0.5, min(3.0, zoomLevel)))
+        scrollView.contentView.postsBoundsChangedNotifications = true
+
+        let documentView = context.coordinator.documentView
+        scrollView.documentView = documentView
+
+        context.coordinator.attach(to: scrollView)
+        context.coordinator.update(from: self, on: scrollView, animatedPageNavigation: false)
+        return scrollView
     }
-    // MARK: - Зуммирование
-    private func performZoomWithFocus(delta: Double, focusPoint: CGPoint, animated: Bool) {
-        let newZoom = max(0.5, min(3.0, zoomLevel + delta))
-        if newZoom == zoomLevel { return }
-        
-        zoomToLevel(newZoom, focusPoint: focusPoint, animated: animated)
+
+    func updateNSView(_ nsView: ContinuousHostingScrollView, context: Context) {
+        context.coordinator.update(from: self, on: nsView, animatedPageNavigation: true)
     }
-    
-    private func resetZoomWithFocus(focusPoint: CGPoint, animated: Bool) {
-        zoomToLevel(1.0, focusPoint: focusPoint, animated: animated)
+
+    static func dismantleNSView(_ nsView: ContinuousHostingScrollView, coordinator: Coordinator) {
+        coordinator.detach()
+        nsView.documentView = nil
     }
-    
-    private func zoomToLevel(_ newZoom: Double, focusPoint: CGPoint, animated: Bool) {
-        guard newZoom != zoomLevel else { return }
-        
-        isPerformingZoom = true
-        
-        let oldZoom = zoomLevel
-        
-        let currentPageInfo = getCurrentPageInfo()
-        let currentPageIndex = currentPageInfo.pageIndex
-        savedPagePosition = currentPageInfo.relativePosition
-        
-        print(" Зум относительно страницы \(currentPageIndex + 1): \(oldZoom) → \(newZoom)")
-        print(" Сохраненная позиция в странице: \(String(format: "%.2f", savedPagePosition))")
-        
-        // Вычисляем центр текущей страницы ДО масштабирования
-        let oldPageCenterY = calculatePageCenterY(for: currentPageIndex, zoom: oldZoom)
-        let currentViewCenterY = -scrollOffset.y + viewportSize.height / 2
-        
-        // Вычисляем смещение от центра страницы до центра экрана
-        let offsetFromPageCenter = currentViewCenterY - oldPageCenterY
-        
-        print(" Центр страницы ДО: \(oldPageCenterY), центр экрана: \(currentViewCenterY)")
-        print(" Смещение от центра страницы: \(offsetFromPageCenter)")
-        
-        // Выполняем зум
-        if animated {
-            withAnimation(.easeOut(duration: 0.2)) {
-                zoomLevel = newZoom
-            }
-        } else {
-            zoomLevel = newZoom
+
+    final class Coordinator: NSObject {
+        private struct ReadingAnchor {
+            let pageIndex: Int
+            let relativeX: CGFloat
+            let relativeY: CGFloat
         }
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + (animated ? 0.25 : 0.05)) {
-            self.restorePositionAfterZoom(
-                pageIndex: currentPageIndex,
-                newZoom: newZoom,
-                offsetFromPageCenter: offsetFromPageCenter,
-                animated: animated
+
+        var parent: ContinuousScrollViewRepresentable
+        let documentView = ContinuousPagesDocumentView()
+
+        private weak var scrollView: ContinuousHostingScrollView?
+        private var boundsObserver: NSObjectProtocol?
+        private var isUpdatingPageFromScroll = false
+        private var isApplyingZoom = false
+        private var lastViewportWidth: CGFloat = 0
+        private var lastLoadedPageCount = 0
+        private var lastAppliedCurrentPage: Int?
+
+        init(parent: ContinuousScrollViewRepresentable) {
+            self.parent = parent
+        }
+
+        func attach(to scrollView: ContinuousHostingScrollView) {
+            guard self.scrollView !== scrollView else { return }
+
+            detach()
+            self.scrollView = scrollView
+            boundsObserver = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification,
+                object: scrollView.contentView,
+                queue: .main
+            ) { [weak self] _ in
+                self?.handleScrollOrMagnificationChange()
+            }
+        }
+
+        func detach() {
+            if let boundsObserver {
+                NotificationCenter.default.removeObserver(boundsObserver)
+                self.boundsObserver = nil
+            }
+            scrollView = nil
+        }
+
+        func update(from parent: ContinuousScrollViewRepresentable, on scrollView: ContinuousHostingScrollView, animatedPageNavigation: Bool) {
+            self.parent = parent
+            attach(to: scrollView)
+
+            let clampedZoom = CGFloat(max(0.5, min(3.0, parent.zoomLevel)))
+            let zoomWillChange = abs(scrollView.magnification - clampedZoom) > 0.001
+            let layoutNeedsAnchorRestore = shouldRestoreAnchorForLayoutChange(parent: parent)
+            let preservedAnchor = (layoutNeedsAnchorRestore || zoomWillChange) ? captureReadingAnchor() : nil
+
+            documentView.updateContent(
+                totalPages: parent.djvuDocument.totalPages,
+                images: parent.djvuDocument.continuousImages,
+                viewportWidth: max(parent.viewportSize.width, 1),
+                magnification: clampedZoom
             )
-        }
-    }
-    
-    private func restorePositionAfterZoom(pageIndex: Int, newZoom: Double, offsetFromPageCenter: CGFloat, animated: Bool) {
-    
-        let newPageCenterY = calculatePageCenterY(for: pageIndex, zoom: newZoom)
-        
 
-        let oldZoom = zoomLevel == newZoom ? lastZoomLevel : zoomLevel // Получаем старый зум
-        let scaledOffsetFromPageCenter = offsetFromPageCenter * (newZoom / oldZoom)
-        let targetViewCenterY = newPageCenterY + scaledOffsetFromPageCenter
-        
+            lastViewportWidth = parent.viewportSize.width
+            lastLoadedPageCount = parent.djvuDocument.continuousImages.count
 
-        let targetScrollY = -(targetViewCenterY - viewportSize.height / 2)
-        let currentScrollY = scrollOffset.y
-        let offsetDelta = targetScrollY - currentScrollY
-        
-        print(" Центр страницы ПОСЛЕ: \(newPageCenterY)")
-        print(" Целевая позиция экрана: \(targetViewCenterY)")
-        print(" Требуемый offset: \(offsetDelta)")
-        
-        // Применяем компенсирующий offset
-        if animated {
-            withAnimation(.easeOut(duration: 0.3)) {
-                currentScrollOffset = offsetDelta
+            if let preservedAnchor, !zoomWillChange {
+                restoreReadingAnchor(preservedAnchor, animated: false)
             }
-        } else {
-            currentScrollOffset = offsetDelta
-        }
-        
-        // Плавно убираем offset через некоторое время
-        DispatchQueue.main.asyncAfter(deadline: .now() + (animated ? 0.4 : 0.2)) {
-            withAnimation(.easeOut(duration: 0.3)) {
-                self.currentScrollOffset = 0
+
+            if zoomWillChange {
+                applyMagnification(clampedZoom, on: scrollView, anchor: preservedAnchor)
             }
-            
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                self.isPerformingZoom = false
+
+            if !isUpdatingPageFromScroll {
+                scrollToRequestedPageIfNeeded(parent.djvuDocument.currentPage, animated: animatedPageNavigation)
             }
         }
-    }
-    
-    // MARK: - Обновление текущей страницы (при ручной прокрутке)
-    private func updateCurrentPageFromScroll() {
-        guard !isPerformingZoom else { return }
-        
-        // Используем нашу функцию для определения текущей страницы
-        let currentPageInfo = getCurrentPageInfo()
-        let visiblePageIndex = currentPageInfo.pageIndex
-        
-        if visiblePageIndex != djvuDocument.currentPage {
-            djvuDocument.currentPage = visiblePageIndex
-            print("📄 Обновлена текущая страница: \(visiblePageIndex + 1)")
+
+        private func shouldRestoreAnchorForLayoutChange(parent: ContinuousScrollViewRepresentable) -> Bool {
+            abs(lastViewportWidth - parent.viewportSize.width) > 0.5 ||
+            lastLoadedPageCount != parent.djvuDocument.continuousImages.count
         }
-    }
-    
-    // MARK: - Загрузка
-    private var loadingView: some View {
-        VStack(spacing: 20) {
-            ProgressView(value: djvuDocument.continuousLoadingProgress, total: 1.0)
-                .frame(width: 200)
-                .progressViewStyle(LinearProgressViewStyle(tint: .accentColor))
-            
-            VStack(spacing: 8) {
-                Text("Подготовка непрерывного просмотра")
-                    .font(.headline)
-                    .fontWeight(.medium)
-                
-                Text("Загружено \(djvuDocument.continuousImages.count) из \(djvuDocument.totalPages) страниц")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+
+        private func captureReadingAnchor() -> ReadingAnchor? {
+            guard let scrollView else { return nil }
+
+            let visibleRect = scrollView.contentView.bounds
+            let centerPoint = CGPoint(x: visibleRect.midX, y: visibleRect.midY)
+            let pageIndex = documentView.pageIndex(at: centerPoint.y)
+
+            guard let pageFrame = documentView.pageFrame(for: pageIndex),
+                  pageFrame.width > 0,
+                  pageFrame.height > 0 else {
+                return nil
             }
+
+            let relativeX = max(0, min(1, (centerPoint.x - pageFrame.minX) / pageFrame.width))
+            let relativeY = max(0, min(1, (centerPoint.y - pageFrame.minY) / pageFrame.height))
+            return ReadingAnchor(pageIndex: pageIndex, relativeX: relativeX, relativeY: relativeY)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            Color(NSColor.textBackgroundColor)
-                .opacity(0.98)
-                .blur(radius: 15)
-        )
-    }
-    
-    // MARK: - Плейсхолдер
-    private var placeholderView: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "rectangle.stack")
-                .font(.system(size: 60, weight: .ultraLight))
-                .foregroundColor(.secondary)
-                .symbolEffect(.pulse.wholeSymbol, options: .repeat(.continuous))
-            
-            VStack(spacing: 10) {
-                Text("Непрерывный просмотр")
-                    .font(.title3)
-                    .fontWeight(.medium)
-                    .foregroundColor(.primary)
-                
-                Text("Переключитесь обратно на постраничный режим или подождите загрузки")
-                    .font(.callout)
-                    .foregroundColor(.secondary)
-                    .multilineTextAlignment(.center)
+
+        private func restoreReadingAnchor(_ anchor: ReadingAnchor, animated: Bool) {
+            guard let pageFrame = documentView.pageFrame(for: anchor.pageIndex) else {
+                return
             }
+
+            let targetCenter = CGPoint(
+                x: pageFrame.minX + pageFrame.width * anchor.relativeX,
+                y: pageFrame.minY + pageFrame.height * anchor.relativeY
+            )
+            scrollToVisibleCenter(targetCenter, animated: animated)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(NSColor.textBackgroundColor))
-    }
-    
-    private func continuousContentView(geometry: GeometryProxy) -> some View {
-        ScrollViewReader { proxy in
-            ScrollView([.horizontal, .vertical], showsIndicators: true) {
-                LazyVStack(spacing: 0) {
-                    ForEach(0..<djvuDocument.totalPages, id: \.self) { pageIndex in
-                        ContinuousPageView(
-                            djvuDocument: djvuDocument,
-                            pageIndex: pageIndex,
-                            geometry: geometry
-                        )
-                        .id("page-\(pageIndex)")
-                        .onAppear {
-                            // Обновляем текущую страницу только при естественной прокрутке
-                            if !isPerformingZoom {
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                    updateCurrentPageFromScroll()
-                                }
-                            }
-                        }
-                    }
+
+        private func scrollToVisibleCenter(_ centerPoint: CGPoint, animated: Bool) {
+            guard let scrollView else { return }
+
+            let clipBounds = scrollView.contentView.bounds
+            let documentBounds = documentView.bounds
+            let maxX = max(0, documentBounds.width - clipBounds.width)
+            let maxY = max(0, documentBounds.height - clipBounds.height)
+            let targetOrigin = CGPoint(
+                x: min(max(0, centerPoint.x - clipBounds.width / 2), maxX),
+                y: min(max(0, centerPoint.y - clipBounds.height / 2), maxY)
+            )
+
+            if animated {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.18
+                    scrollView.contentView.animator().setBoundsOrigin(targetOrigin)
                 }
-                .scaleEffect(zoomLevel, anchor: .top) // Изменено с .topLeading на .top для центрирования
-                .offset(y: currentScrollOffset) // Компенсирующий offset для сохранения позиции
-                .background(
-                    GeometryReader { contentGeometry in
-                        Color.clear
-                            .preference(key: ScrollOffsetPreferenceKey.self,
-                                      value: contentGeometry.frame(in: .named("scrollView")).origin)
-                            .onPreferenceChange(ContentSizePreferenceKey.self) { size in
-                                contentSize = size
-                            }
-                    }
+            } else {
+                scrollView.contentView.setBoundsOrigin(targetOrigin)
+            }
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+
+        private func scrollToRequestedPageIfNeeded(_ pageIndex: Int, animated: Bool) {
+            guard let pageFrame = documentView.pageFrame(for: pageIndex),
+                  lastAppliedCurrentPage != pageIndex else {
+                return
+            }
+
+            let currentVisiblePage = documentView.pageIndex(at: scrollView?.contentView.bounds.midY ?? 0)
+            if currentVisiblePage == pageIndex {
+                lastAppliedCurrentPage = pageIndex
+                return
+            }
+
+            guard let scrollView else { return }
+
+            let clipBounds = scrollView.contentView.bounds
+            let documentBounds = documentView.bounds
+            let maxY = max(0, documentBounds.height - clipBounds.height)
+            let targetOrigin = CGPoint(
+                x: min(max(0, clipBounds.origin.x), max(0, documentBounds.width - clipBounds.width)),
+                y: min(max(0, pageFrame.minY), maxY)
+            )
+
+            if animated {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.18
+                    scrollView.contentView.animator().setBoundsOrigin(targetOrigin)
+                }
+            } else {
+                scrollView.contentView.setBoundsOrigin(targetOrigin)
+            }
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            lastAppliedCurrentPage = pageIndex
+        }
+
+        private func applyMagnification(_ magnification: CGFloat, on scrollView: ContinuousHostingScrollView, anchor: ReadingAnchor?) {
+            isApplyingZoom = true
+
+            if let anchor,
+               let pageFrame = documentView.pageFrame(for: anchor.pageIndex) {
+                let centerPoint = CGPoint(
+                    x: pageFrame.minX + pageFrame.width * anchor.relativeX,
+                    y: pageFrame.minY + pageFrame.height * anchor.relativeY
                 )
-                .onAppear {
-                    scrollReader = proxy
-                    
-                    // Первоначальная прокрутка к текущей странице (только один раз)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                        if !isPerformingZoom {
-                            proxy.scrollTo("page-\(djvuDocument.currentPage)", anchor: .top)
-                        }
-                    }
-                }
-                .onChange(of: djvuDocument.currentPage) { newPage in
-                    // Автопрокрутка к странице ТОЛЬКО если она изменилась не из-за зума
-                    if !isPerformingZoom {
-                        withAnimation(.easeInOut(duration: 0.5)) {
-                            proxy.scrollTo("page-\(newPage)", anchor: .top)
-                        }
-                    }
-                }
+                scrollView.setMagnification(magnification, centeredAt: centerPoint)
+            } else {
+                scrollView.magnification = magnification
             }
-            .coordinateSpace(name: "scrollView")
-            .onPreferenceChange(ScrollOffsetPreferenceKey.self) { value in
-                scrollOffset = value
-                updateCurrentPageFromScroll()
+
+            DispatchQueue.main.async {
+                self.isApplyingZoom = false
+                self.handleScrollOrMagnificationChange()
             }
-            // Обработка жестов зумирования относительно центра текущей страницы
-            .gesture(
-                MagnificationGesture()
-                    .onChanged { value in
-                        if !isPerformingZoom {
-                            isPerformingZoom = true
-                            lastZoomLevel = zoomLevel
-                            
-                            // Сохраняем информацию о текущей странице при начале жеста
-                            let currentPageInfo = getCurrentPageInfo()
-                            savedPagePosition = currentPageInfo.relativePosition
-                            
-                            zoomCenterPoint = CGPoint(x: viewportSize.width / 2, y: viewportSize.height / 2)
-                        }
-                        
-                        let newZoom = max(0.5, min(3.0, lastZoomLevel * value))
-                        zoomLevel = newZoom
-                    }
-                    .onEnded { _ in
-                        lastZoomLevel = zoomLevel
-                        
-                        // Получаем текущую страницу для восстановления позиции
-                        let currentPageInfo = getCurrentPageInfo()
-                        let pageIndex = currentPageInfo.pageIndex
-                        
-                        // Восстанавливаем позицию после жеста
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            self.restorePositionAfterZoom(
-                                pageIndex: pageIndex,
-                                newZoom: self.zoomLevel,
-                                offsetFromPageCenter: 0, // Для жестов используем центр страницы
-                                animated: false
-                            )
-                        }
-                        
-                        // Привязка к стандартным значениям (как в Preview)
-                        let snapValues: [Double] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0]
-                        if let closest = snapValues.min(by: { abs($0 - zoomLevel) < abs($1 - zoomLevel) }),
-                           abs(closest - zoomLevel) < 0.08 {
-                            
-                            withAnimation(.easeOut(duration: 0.2)) {
-                                zoomLevel = closest
-                                lastZoomLevel = closest
-                            }
-                            
-                            // Восстанавливаем позицию для привязанного значения
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                                self.restorePositionAfterZoom(
-                                    pageIndex: pageIndex,
-                                    newZoom: closest,
-                                    offsetFromPageCenter: 0,
-                                    animated: true
-                                )
-                            }
-                        }
-                        
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
-                            self.isPerformingZoom = false
-                        }
-                    }
-            )
-            // Обработка зума колесом мыши
-            .onContinuousHover { phase in
-                switch phase {
-                case .active(let location):
-                    gestureLocation = location
-                case .ended:
-                    break
+        }
+
+        private func handleScrollOrMagnificationChange() {
+            guard let scrollView else { return }
+
+            let visiblePage = documentView.pageIndex(at: scrollView.contentView.bounds.midY)
+            lastAppliedCurrentPage = visiblePage
+
+            if !isUpdatingPageFromScroll && parent.djvuDocument.currentPage != visiblePage {
+                isUpdatingPageFromScroll = true
+                parent.djvuDocument.currentPage = visiblePage
+                DispatchQueue.main.async {
+                    self.isUpdatingPageFromScroll = false
                 }
             }
-            .onAppear {
-                lastZoomLevel = zoomLevel
-                currentScrollOffset = 0
-                savedPagePosition = 0
-            }
-            .onChange(of: zoomLevel) { newValue in
-                // Ограничиваем зум в допустимых пределах
-                let clampedValue = max(0.5, min(3.0, newValue))
-                if clampedValue != newValue {
-                    DispatchQueue.main.async {
-                        zoomLevel = clampedValue
-                    }
-                }
-                
-                // Обновляем lastZoomLevel только если не выполняется программное масштабирование
-                if !isPerformingZoom {
-                    lastZoomLevel = clampedValue
+
+            if !isApplyingZoom {
+                let magnification = Double(scrollView.magnification)
+                if abs(parent.zoomLevel - magnification) > 0.001 {
+                    parent.zoomLevel = magnification
                 }
             }
         }
-        .background(Color(NSColor.textBackgroundColor))
     }
 }
 
-// MARK: - Страница в непрерывном режиме
-struct ContinuousPageView: View {
-    @ObservedObject var djvuDocument: DJVUDocument
-    let pageIndex: Int
-    let geometry: GeometryProxy
-    
-    var body: some View {
-        Group {
-            if let image = djvuDocument.continuousImages[pageIndex] {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: geometry.size.width)
-                    .background(Color.white) // Белый фон как в Preview
-                    .shadow(color: .black.opacity(0.1), radius: 1, x: 0, y: 1) // Тонкая тень между страницами
-            } else {
-                // Плейсхолдер для загружающейся страницы в стиле Preview
-                Rectangle()
-                    .fill(Color.secondary.opacity(0.05))
-                    .aspectRatio(0.75, contentMode: .fit)
-                    .frame(maxWidth: geometry.size.width)
-                    .overlay(
-                        VStack(spacing: 8) {
-                            ProgressView()
-                                .scaleEffect(0.8)
-                                .progressViewStyle(CircularProgressViewStyle(tint: .accentColor))
-                            
-                            Text("Страница \(pageIndex + 1)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    )
-                    .background(Color.white)
-                    .shadow(color: .black.opacity(0.1), radius: 1, x: 0, y: 1)
-            }
+private final class ContinuousHostingScrollView: NSScrollView {
+    override var acceptsFirstResponder: Bool { true }
+}
+
+private final class ContinuousPagesDocumentView: NSView {
+    private static let verticalSpacing: CGFloat = 8
+    fileprivate static let placeholderAspectRatio: CGFloat = 0.75
+
+    private var pageViews: [Int: ContinuousPageItemView] = [:]
+    private var pageFrames: [Int: CGRect] = [:]
+
+    override var isFlipped: Bool { true }
+
+    func updateContent(totalPages: Int, images: [Int: NSImage], viewportWidth: CGFloat, magnification: CGFloat) {
+        syncPageViews(totalPages: totalPages)
+
+        for pageIndex in 0..<totalPages {
+            pageViews[pageIndex]?.update(
+                image: images[pageIndex],
+                pageIndex: pageIndex
+            )
         }
-        .padding(.vertical, 4) // Небольшое разделение между страницами как в Preview
+
+        layoutPages(totalPages: totalPages, viewportWidth: viewportWidth, magnification: magnification)
+    }
+
+    func pageFrame(for pageIndex: Int) -> CGRect? {
+        pageFrames[pageIndex]
+    }
+
+    func pageIndex(at y: CGFloat) -> Int {
+        let sortedFrames = pageFrames.sorted { $0.key < $1.key }
+
+        if let containing = sortedFrames.first(where: { _, frame in
+            y >= frame.minY && y <= frame.maxY
+        }) {
+            return containing.key
+        }
+
+        if let nearest = sortedFrames.min(by: { lhs, rhs in
+            abs(lhs.value.midY - y) < abs(rhs.value.midY - y)
+        }) {
+            return nearest.key
+        }
+
+        return 0
+    }
+
+    private func syncPageViews(totalPages: Int) {
+        let existingKeys = Set(pageViews.keys)
+        let requiredKeys = Set(0..<totalPages)
+
+        for pageIndex in existingKeys.subtracting(requiredKeys) {
+            pageViews[pageIndex]?.removeFromSuperview()
+            pageViews[pageIndex] = nil
+        }
+
+        for pageIndex in requiredKeys.subtracting(existingKeys) {
+            let pageView = ContinuousPageItemView()
+            addSubview(pageView)
+            pageViews[pageIndex] = pageView
+        }
+    }
+
+    private func layoutPages(totalPages: Int, viewportWidth: CGFloat, magnification: CGFloat) {
+        let pageWidth = max(viewportWidth, 1)
+        let contentWidth = magnification < 1 ? max(pageWidth / magnification, pageWidth) : pageWidth
+        var frames: [Int: CGRect] = [:]
+        var currentY: CGFloat = 0
+
+        for pageIndex in 0..<totalPages {
+            guard let pageView = pageViews[pageIndex] else { continue }
+
+            let pageSize = pageView.preferredSize(forWidth: pageWidth)
+            let frame = CGRect(
+                x: (contentWidth - pageSize.width) / 2,
+                y: currentY,
+                width: pageSize.width,
+                height: pageSize.height
+            )
+
+            pageView.frame = frame
+            frames[pageIndex] = frame
+            currentY = frame.maxY + Self.verticalSpacing
+        }
+
+        if totalPages > 0 {
+            currentY -= Self.verticalSpacing
+        }
+
+        pageFrames = frames
+        frame = CGRect(origin: .zero, size: CGSize(width: contentWidth, height: max(1, currentY)))
+    }
+}
+
+private final class ContinuousPageItemView: NSView {
+    private let imageView = NSImageView()
+    private let placeholderView = NSView()
+    private let progressIndicator = NSProgressIndicator()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private var image: NSImage?
+
+    override var isFlipped: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.white.cgColor
+        layer?.shadowColor = NSColor.black.withAlphaComponent(0.1).cgColor
+        layer?.shadowOpacity = 1
+        layer?.shadowRadius = 1
+        layer?.shadowOffset = CGSize(width: 0, height: 1)
+
+        imageView.imageScaling = .scaleAxesIndependently
+        imageView.imageAlignment = .alignCenter
+        imageView.wantsLayer = true
+        addSubview(imageView)
+
+        placeholderView.wantsLayer = true
+        placeholderView.layer?.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.05).cgColor
+        addSubview(placeholderView)
+
+        progressIndicator.style = .spinning
+        progressIndicator.controlSize = .small
+        progressIndicator.startAnimation(nil)
+        placeholderView.addSubview(progressIndicator)
+
+        titleLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        titleLabel.textColor = .secondaryLabelColor
+        titleLabel.alignment = .center
+        placeholderView.addSubview(titleLabel)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func update(image: NSImage?, pageIndex: Int) {
+        self.image = image
+        imageView.image = image
+        imageView.isHidden = image == nil
+        placeholderView.isHidden = image != nil
+        titleLabel.stringValue = "Страница \(pageIndex + 1)"
+        needsLayout = true
+    }
+
+    func preferredSize(forWidth width: CGFloat) -> CGSize {
+        let aspectRatio = image.map { $0.size.height / max($0.size.width, 1) } ??
+            (1 / ContinuousPagesDocumentView.placeholderAspectRatio)
+        return CGSize(width: width, height: max(1, width * aspectRatio))
+    }
+
+    override func layout() {
+        super.layout()
+
+        imageView.frame = bounds
+        placeholderView.frame = bounds
+        progressIndicator.sizeToFit()
+        progressIndicator.frame.origin = CGPoint(
+            x: (bounds.width - progressIndicator.frame.width) / 2,
+            y: max(20, bounds.height * 0.42 - progressIndicator.frame.height)
+        )
+        titleLabel.sizeToFit()
+        titleLabel.frame = CGRect(
+            x: 0,
+            y: progressIndicator.frame.maxY + 8,
+            width: bounds.width,
+            height: titleLabel.frame.height
+        )
     }
 }
 
@@ -1053,24 +1066,6 @@ struct WelcomeView: View {
             }
         }
         return true
-    }
-}
-
-// MARK: - Отслеживание позиции прокрутки
-struct ScrollOffsetPreferenceKey: PreferenceKey {
-    static var defaultValue: CGPoint = .zero
-    
-    static func reduce(value: inout CGPoint, nextValue: () -> CGPoint) {
-        value = nextValue()
-    }
-}
-
-// MARK: - Отслеживане размера контента
-struct ContentSizePreferenceKey: PreferenceKey {
-    static var defaultValue: CGSize = .zero
-    
-    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
-        value = nextValue()
     }
 }
 
