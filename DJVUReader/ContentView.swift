@@ -261,6 +261,10 @@ struct ContinuousDocumentView: View {
     @State private var lastZoomLevel: Double = 1.0
     @State private var scrollOffset: CGPoint = .zero
     @State private var lastPageUpdateTime: CFTimeInterval = 0
+    // Индекс страницы, на которую currentPage был установлен в результате
+    // естественного скролла. Позволяет отличить его от программной навигации
+    // (next/prev/goToPage) и не триггерить автопрокрутку во время скролла.
+    @State private var scrollDrivenPageIndex: Int? = nil
     @State private var zoomAnchor: UnitPoint = .center
     @State private var gestureLocation: CGPoint = .zero
     @State private var viewportSize: CGSize = .zero
@@ -480,6 +484,7 @@ struct ContinuousDocumentView: View {
         let visiblePageIndex = currentPageInfo.pageIndex
         
         if visiblePageIndex != djvuDocument.currentPage {
+            scrollDrivenPageIndex = visiblePageIndex
             djvuDocument.currentPage = visiblePageIndex
         }
     }
@@ -570,7 +575,13 @@ struct ContinuousDocumentView: View {
                     }
                 }
                 .onChange(of: djvuDocument.currentPage) { newPage in
-                    // Автопрокрутка к странице ТОЛЬКО если она изменилась не из-за зума
+                    // Если страница изменилась из-за естественной прокрутки —
+                    // не трогаем scroll offset: scrollTo() посреди user-скролла
+                    // вызывает визуальное «подпрыгивание».
+                    if scrollDrivenPageIndex == newPage {
+                        scrollDrivenPageIndex = nil
+                        return
+                    }
                     if !isPerformingZoom {
                         withAnimation(.easeInOut(duration: 0.5)) {
                             proxy.scrollTo("page-\(newPage)", anchor: .top)
