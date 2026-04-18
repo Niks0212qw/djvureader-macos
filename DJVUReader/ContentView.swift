@@ -1,4 +1,5 @@
 import SwiftUI
+import QuartzCore
 
 struct ContentView: View {
     @StateObject private var djvuDocument = DJVUDocument()
@@ -259,6 +260,7 @@ struct ContinuousDocumentView: View {
     @Binding var zoomLevel: Double
     @State private var lastZoomLevel: Double = 1.0
     @State private var scrollOffset: CGPoint = .zero
+    @State private var lastPageUpdateTime: CFTimeInterval = 0
     @State private var zoomAnchor: UnitPoint = .center
     @State private var gestureLocation: CGPoint = .zero
     @State private var viewportSize: CGSize = .zero
@@ -309,15 +311,10 @@ struct ContinuousDocumentView: View {
             }
         }
         .onAppear {
-            print("📱 ContinuousDocumentView появился на экране")
-            print("📊 continuousImages содержит: \(djvuDocument.continuousImages.count) страниц")
             setupKeyboardZoomObservers()
         }
         .onDisappear {
             removeKeyboardZoomObservers()
-        }
-        .onChange(of: djvuDocument.continuousImages.count) { count in
-            print("🔔 continuousImages изменился: теперь \(count) страниц")
         }
     }
     
@@ -366,9 +363,7 @@ struct ContinuousDocumentView: View {
         let pageStartY = CGFloat(currentPageIndex) * estimatedPageHeight
         let positionInPage = (adjustedScrollY - pageStartY) / estimatedPageHeight
         let clampedPosition = max(0, min(1, positionInPage))
-        
-        print("📍 Текущая страница: \(currentPageIndex + 1), позиция в странице: \(String(format: "%.2f", clampedPosition))")
-        
+
         return (currentPageIndex, clampedPosition, pageStartY)
     }
 
@@ -486,7 +481,6 @@ struct ContinuousDocumentView: View {
         
         if visiblePageIndex != djvuDocument.currentPage {
             djvuDocument.currentPage = visiblePageIndex
-            print("📄 Обновлена текущая страница: \(visiblePageIndex + 1)")
         }
     }
     
@@ -545,19 +539,12 @@ struct ContinuousDocumentView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(0..<djvuDocument.totalPages, id: \.self) { pageIndex in
                         ContinuousPageView(
-                            djvuDocument: djvuDocument,
+                            image: djvuDocument.continuousImages[pageIndex],
                             pageIndex: pageIndex,
                             geometry: geometry
                         )
+                        .equatable()
                         .id("page-\(pageIndex)")
-                        .onAppear {
-                            // Обновляем текущую страницу только при естественной прокрутке
-                            if !isPerformingZoom {
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                    updateCurrentPageFromScroll()
-                                }
-                            }
-                        }
                     }
                 }
                 .scaleEffect(zoomLevel, anchor: .top) // Изменено с .topLeading на .top для центрирования
@@ -594,7 +581,11 @@ struct ContinuousDocumentView: View {
             .coordinateSpace(name: "scrollView")
             .onPreferenceChange(ScrollOffsetPreferenceKey.self) { value in
                 scrollOffset = value
-                updateCurrentPageFromScroll()
+                let now = CACurrentMediaTime()
+                if now - lastPageUpdateTime >= 0.1 {
+                    lastPageUpdateTime = now
+                    updateCurrentPageFromScroll()
+                }
             }
             // Обработка жестов зумирования относительно центра текущей страницы
             .gesture(
@@ -691,14 +682,20 @@ struct ContinuousDocumentView: View {
 }
 
 // MARK: - Страница в непрерывном режиме
-struct ContinuousPageView: View {
-    @ObservedObject var djvuDocument: DJVUDocument
+struct ContinuousPageView: View, Equatable {
+    let image: NSImage?
     let pageIndex: Int
     let geometry: GeometryProxy
-    
+
+    static func == (lhs: ContinuousPageView, rhs: ContinuousPageView) -> Bool {
+        lhs.pageIndex == rhs.pageIndex
+            && lhs.image === rhs.image
+            && lhs.geometry.size == rhs.geometry.size
+    }
+
     var body: some View {
         Group {
-            if let image = djvuDocument.continuousImages[pageIndex] {
+            if let image = image {
                 Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)

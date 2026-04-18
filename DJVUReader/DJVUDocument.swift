@@ -2,6 +2,19 @@ import Foundation
 import AppKit
 import PDFKit
 
+private extension NSCache where KeyType == NSNumber, ObjectType == NSImage {
+    subscript(key: Int) -> NSImage? {
+        get { object(forKey: NSNumber(value: key)) }
+        set {
+            if let newValue = newValue {
+                setObject(newValue, forKey: NSNumber(value: key))
+            } else {
+                removeObject(forKey: NSNumber(value: key))
+            }
+        }
+    }
+}
+
 // Режим просмотра документа
 enum ViewMode: String, CaseIterable, Identifiable {
     case single = "single"
@@ -32,7 +45,11 @@ class DJVUDocument: ObservableObject {
     @Published var isContinuousLoading: Bool = false
     
     private var documentURL: URL?
-    private var imageCache: [Int: NSImage] = [:]
+    private let imageCache: NSCache<NSNumber, NSImage> = {
+        let cache = NSCache<NSNumber, NSImage>()
+        cache.countLimit = 60
+        return cache
+    }()
     private var thumbnailCache: [Int: NSImage] = [:]
     private var pdfDocument: PDFDocument?
     
@@ -53,7 +70,6 @@ class DJVUDocument: ObservableObject {
         
         do {
             try FileManager.default.copyItem(at: originalURL, to: tempURL)
-            print(" Создана временная копия: \(tempURL.lastPathComponent)")
             return tempURL
         } catch {
             print(" Не удалось скопировать файл: \(error)")
@@ -86,7 +102,7 @@ class DJVUDocument: ObservableObject {
         
         // Очищаем кэш в фоне
         cacheQueue.async {
-            self.imageCache.removeAll()
+            self.imageCache.removeAllObjects()
             self.thumbnailCache.removeAll()
             self.preloadQueue.removeAll()
             self.continuousLoadingQueue.removeAll()
@@ -125,7 +141,6 @@ class DJVUDocument: ObservableObject {
             self.viewMode = mode
             
             if mode == .continuous {
-                print(" Текущий кэш содержит \(self.imageCache.count) страниц")
                 print(" continuousImages содержит \(self.continuousImages.count) страниц")
                 
                 // Очищаем и заново заполняем continuousImages
@@ -156,7 +171,6 @@ class DJVUDocument: ObservableObject {
             if let image = imageCache[pageIndex] {
                 continuousImages[pageIndex] = image
                 addedCount += 1
-                print(" Добавили страницу \(pageIndex + 1) из кэша")
             }
         }
         print(" Добавлено \(addedCount) страниц из кэша в continuousImages")
@@ -192,38 +206,26 @@ class DJVUDocument: ObservableObject {
         }
         
         continuousQueue.async {
-            let batchSize = 3 // Загружаем по 3 страницы одновременно
-            let totalBatches = (pagesToLoad.count + batchSize - 1) / batchSize
-            
-            for batchIndex in 0..<totalBatches {
-                let startIndex = batchIndex * batchSize
-                let endIndex = min(startIndex + batchSize, pagesToLoad.count)
-                let batchPages = Array(pagesToLoad[startIndex..<endIndex])
-                
-                let group = DispatchGroup()
-                
-                for pageIndex in batchPages {
-                    group.enter()
-                    self.backgroundQueue.async {
-                        self.loadPageForContinuous(pageIndex: pageIndex) {
-                            group.leave()
+            let concurrency = 3
+            let semaphore = DispatchSemaphore(value: concurrency)
+            let group = DispatchGroup()
+
+            for pageIndex in pagesToLoad {
+                semaphore.wait()
+                group.enter()
+                self.backgroundQueue.async {
+                    self.loadPageForContinuous(pageIndex: pageIndex) {
+                        semaphore.signal()
+                        DispatchQueue.main.async {
+                            let loadedCount = self.continuousImages.count
+                            self.continuousLoadingProgress = Double(loadedCount) / Double(self.totalPages)
                         }
+                        group.leave()
                     }
                 }
-                
-                group.wait()
-                
-                DispatchQueue.main.async {
-                    let loadedCount = self.continuousImages.count
-                    self.continuousLoadingProgress = Double(loadedCount) / Double(self.totalPages)
-                    print(" Прогресс загрузки: \(loadedCount)/\(self.totalPages)")
-                }
-                
-                // Небольшая пауза между батчами
-                Thread.sleep(forTimeInterval: 0.1)
             }
-            
-            DispatchQueue.main.async {
+
+            group.notify(queue: .main) {
                 self.isContinuousLoading = false
                 self.continuousLoadingProgress = 1.0
                 print(" Все страницы загружены для непрерывного просмотра: \(self.continuousImages.count)/\(self.totalPages)")
@@ -238,25 +240,22 @@ class DJVUDocument: ObservableObject {
         if let cachedImage = imageCache[pageIndex] {
             DispatchQueue.main.async {
                 self.continuousImages[pageIndex] = cachedImage
-                print(" Страница \(pageIndex + 1) взята из кэша для непрерывного просмотра")
             }
             return
         }
-        
+
         // Проверяем, что мы уже не загружаем эту страницу
         guard !continuousLoadingQueue.contains(pageIndex) else {
-            print(" Страница \(pageIndex + 1) уже загружается")
             return
         }
-        
+
         continuousLoadingQueue.insert(pageIndex)
-        
+
         defer {
             continuousLoadingQueue.remove(pageIndex)
         }
-        
-        print(" Загружаем страницу \(pageIndex + 1) для непрерывного просмотра")
-        
+
+
         if let pdfDocument = self.pdfDocument {
             loadPDFPageForContinuous(pageIndex: pageIndex, pdfDocument: pdfDocument)
         } else if let documentURL = self.documentURL {
@@ -292,7 +291,6 @@ class DJVUDocument: ObservableObject {
             
             DispatchQueue.main.async {
                 self.continuousImages[pageIndex] = image
-                print(" PDF страница \(pageIndex + 1) загружена для непрерывного просмотра")
             }
         }
     }
@@ -340,7 +338,6 @@ class DJVUDocument: ObservableObject {
                         
                         DispatchQueue.main.async {
                             self.continuousImages[pageIndex] = image
-                            print(" DJVU страница \(pageIndex + 1) загружена для непрерывного просмотра")
                         }
                     }
                 } else {
@@ -393,7 +390,6 @@ class DJVUDocument: ObservableObject {
         
         for path in commonPaths {
             if FileManager.default.fileExists(atPath: path) {
-                print(" Найден \(name) по пути: \(path)")
                 return path
             }
         }
@@ -413,7 +409,6 @@ class DJVUDocument: ObservableObject {
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !path.isEmpty {
-                    print(" Найден \(name) через which: \(path)")
                     return path
                 }
             }
@@ -731,9 +726,8 @@ class DJVUDocument: ObservableObject {
         
         cacheQueue.async {
             self.imageCache[pageIndex] = image
-            self.limitCacheSize()
         }
-        
+
         DispatchQueue.main.async {
             if self.currentPage == pageIndex {
                 self.currentImage = image
@@ -826,7 +820,6 @@ class DJVUDocument: ObservableObject {
                                 
                                 cacheQueue.async {
                                     self.imageCache[pageIndex] = image
-                                    self.limitCacheSize()
                                 }
                                 
                                 DispatchQueue.main.async {
@@ -902,15 +895,14 @@ class DJVUDocument: ObservableObject {
                 }
                 
                 self.preloadQueue.insert(pageIndex)
-                print(" Планируем фоновую загрузку страницы \(pageIndex + 1)")
-                
+
                 self.backgroundQueue.async {
                     self.preloadPageSilently(pageIndex: pageIndex, totalToLoad: totalPagesToPreload)
                 }
-                
+
                 Thread.sleep(forTimeInterval: 0.1)
             }
-            
+
             for pageIndex in 0..<self.totalPages {
                 guard pageIndex != startPage,
                       !nearbyPages.contains(pageIndex),
@@ -919,14 +911,13 @@ class DJVUDocument: ObservableObject {
                     self.updateBackgroundProgress(totalToLoad: totalPagesToPreload)
                     continue
                 }
-                
+
                 self.preloadQueue.insert(pageIndex)
-                print(" Планируем фоновую загрузку страницы \(pageIndex + 1)")
-                
+
                 self.backgroundQueue.async {
                     self.preloadPageSilently(pageIndex: pageIndex, totalToLoad: totalPagesToPreload)
                 }
-                
+
                 Thread.sleep(forTimeInterval: 0.2)
             }
             
@@ -956,8 +947,7 @@ class DJVUDocument: ObservableObject {
                       !self.preloadQueue.contains(pageIndex) else { continue }
                 
                 self.preloadQueue.insert(pageIndex)
-                print(" Планируем предзагрузку страницы \(pageIndex + 1)")
-                
+
                 self.backgroundQueue.async {
                     self.preloadPageSilently(pageIndex: pageIndex, totalToLoad: 0)
                 }
@@ -966,8 +956,6 @@ class DJVUDocument: ObservableObject {
     }
     
     private func preloadPageSilently(pageIndex: Int, totalToLoad: Int = 0) {
-        print(" Предзагружаем страницу \(pageIndex + 1) в фоне")
-        
         defer {
             preloadQueue_dispatch.async {
                 self.preloadQueue.remove(pageIndex)
@@ -1006,11 +994,9 @@ class DJVUDocument: ObservableObject {
         
         cacheQueue.async {
             self.imageCache[pageIndex] = image
-            self.limitCacheSize()
-            print(" PDF страница \(pageIndex + 1) предзагружена в кэш")
         }
     }
-    
+
     private func preloadDJVUPageSilently(pageIndex: Int, documentURL: URL) {
         guard let ddjvuPath = findSystemExecutable(name: "ddjvu") else { return }
         
@@ -1047,8 +1033,6 @@ class DJVUDocument: ObservableObject {
                 if let image = NSImage(contentsOf: tempImageURL) {
                     cacheQueue.async {
                         self.imageCache[pageIndex] = image
-                        self.limitCacheSize()
-                        print(" DJVU страница \(pageIndex + 1) предзагружена в кэш")
                     }
                 }
             }
@@ -1057,15 +1041,6 @@ class DJVUDocument: ObservableObject {
         } catch {
             print(" Ошибка предзагрузки DJVU страницы \(pageIndex + 1): \(error)")
             try? FileManager.default.removeItem(at: tempImageURL)
-        }
-    }
-    
-    private func limitCacheSize() {
-        if imageCache.count > 20 { // Увеличиваем размер кэша
-            let oldestKeys = Array(imageCache.keys).sorted().prefix(imageCache.count - 15)
-            for key in oldestKeys {
-                imageCache.removeValue(forKey: key)
-            }
         }
     }
     
@@ -1223,7 +1198,7 @@ class DJVUDocument: ObservableObject {
     // MARK: - Cache Management
     func clearCache() {
         cacheQueue.async {
-            self.imageCache.removeAll()
+            self.imageCache.removeAllObjects()
             self.thumbnailCache.removeAll()
         }
         
