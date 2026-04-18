@@ -122,32 +122,9 @@ class DJVUDocument: ObservableObject {
     private let continuousRenderQueue = DispatchQueue(label: "djvu.continuous.render", qos: .utility, attributes: .concurrent)
     private let djvuRendererQueue = DispatchQueue(label: "djvu.renderer.queue", qos: .userInitiated)
     
-    private func copyToTempWithASCIIName(originalURL: URL) -> URL? {
-        let tempDir = FileManager.default.temporaryDirectory
-        let asciiName = "djvu_copy_\(UUID().uuidString).\(originalURL.pathExtension)"
-        let tempURL = tempDir.appendingPathComponent(asciiName)
-        
-        do {
-            try FileManager.default.copyItem(at: originalURL, to: tempURL)
-            print(" Создана временная копия: \(tempURL.lastPathComponent)")
-            return tempURL
-        } catch {
-            print(" Не удалось скопировать файл: \(error)")
-            return nil
-        }
-    }
-    
-    private func hasNonASCIICharacters(in url: URL) -> Bool {
-        return !url.lastPathComponent.allSatisfy({ $0.isASCII })
-    }
-    
     func loadDocument(from url: URL) {
         documentURL = url
         errorMessage = ""
-        
-        if hasNonASCIICharacters(in: url) {
-            print(" Обнаружены non-ASCII символы в имени файла: \(url.lastPathComponent)")
-        }
         
         DispatchQueue.main.async {
             self.backgroundLoadingProgress = 0.0
@@ -514,10 +491,9 @@ class DJVUDocument: ObservableObject {
     private func renderContinuousImage(for request: ContinuousRenderRequest) -> NSImage? {
         if let pdfDocument = self.pdfDocument {
             return renderPDFPageForContinuous(pageIndex: request.pageIndex, pdfDocument: pdfDocument, pixelSize: request.pixelSize)
-        } else if let documentURL = self.documentURL {
+        } else if self.djvuRenderer != nil {
             return renderDJVUPageForContinuous(
                 pageIndex: request.pageIndex,
-                documentURL: documentURL,
                 pixelSize: request.pixelSize,
                 isPreview: request.isPreview
             )
@@ -595,78 +571,8 @@ class DJVUDocument: ObservableObject {
         return image
     }
 
-    private func renderDJVUPageUsingDDJVU(pageIndex: Int, documentURL: URL, pixelSize: CGSize) -> NSImage? {
-        guard let ddjvuPath = findSystemExecutable(name: "ddjvu") else {
-            print(" ddjvu не найден для загрузки страницы \(pageIndex + 1)")
-            return nil
-        }
-
-        var workingURL = documentURL
-        var needsCleanup = false
-
-        if hasNonASCIICharacters(in: documentURL) {
-            if let tempURL = copyToTempWithASCIIName(originalURL: documentURL) {
-                workingURL = tempURL
-                needsCleanup = true
-            }
-        }
-
-        defer {
-            if needsCleanup {
-                try? FileManager.default.removeItem(at: workingURL)
-            }
-        }
-
-        let tempDir = FileManager.default.temporaryDirectory
-        let tempImageURL = tempDir.appendingPathComponent("djvu_continuous_\(pageIndex)_\(UUID().uuidString).ppm")
-        let settings = [
-            "-format=ppm",
-            "-page=\(pageIndex + 1)",
-            "-size=\(Int(pixelSize.width))x\(Int(pixelSize.height))"
-        ]
-
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: ddjvuPath)
-        task.arguments = settings + [workingURL.path, tempImageURL.path]
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-
-            if task.terminationStatus == 0 && FileManager.default.fileExists(atPath: tempImageURL.path) {
-                if let image = NSImage(contentsOf: tempImageURL) {
-                    try? FileManager.default.removeItem(at: tempImageURL)
-                    return image
-                }
-
-                print(" Не удалось создать NSImage из DJVU страницы \(pageIndex + 1)")
-            } else {
-                print(" Ошибка конвертации DJVU страницы \(pageIndex + 1), код: \(task.terminationStatus)")
-            }
-
-            try? FileManager.default.removeItem(at: tempImageURL)
-        } catch {
-            print(" Исключение при загрузке DJVU страницы \(pageIndex + 1): \(error)")
-            try? FileManager.default.removeItem(at: tempImageURL)
-        }
-
-        return nil
-    }
-    
-    private func renderDJVUPageForContinuous(pageIndex: Int, documentURL: URL, pixelSize: CGSize, isPreview: Bool) -> NSImage? {
-        if isPreview {
-            if let renderedImage = renderDJVUPageUsingRenderer(pageIndex: pageIndex, pixelSize: pixelSize, isPreview: true) {
-                return renderedImage
-            }
-
-            return renderDJVUPageUsingDDJVU(pageIndex: pageIndex, documentURL: documentURL, pixelSize: pixelSize)
-        }
-
-        if let renderedImage = renderDJVUPageUsingRenderer(pageIndex: pageIndex, pixelSize: pixelSize, isPreview: false) {
-            return renderedImage
-        }
-
-        return renderDJVUPageUsingDDJVU(pageIndex: pageIndex, documentURL: documentURL, pixelSize: pixelSize)
+    private func renderDJVUPageForContinuous(pageIndex: Int, pixelSize: CGSize, isPreview: Bool) -> NSImage? {
+        renderDJVUPageUsingRenderer(pageIndex: pageIndex, pixelSize: pixelSize, isPreview: isPreview)
     }
     
     // MARK: - PDF Support
@@ -713,15 +619,14 @@ class DJVUDocument: ObservableObject {
             }
             return
         } catch {
-            print(" libdjvu renderer не инициализирован, используем fallback: \(error.localizedDescription)")
-        }
-        
-        guard let djvusedPath = findSystemExecutable(name: "djvused") else {
-            errorMessage = "DJVU утилиты не установлены. Установите djvulibre через Homebrew: brew install djvulibre"
+            let message = "Не удалось открыть DJVU через встроенный renderer: \(error.localizedDescription)"
+            print(" \(message)")
+            DispatchQueue.main.async {
+                self.errorMessage = message
+                self.isLoaded = false
+            }
             return
         }
-        
-        getDJVUPageCount(url: url, djvusedPath: djvusedPath)
     }
 
     private func createPersistentDJVURenderers(for url: URL, preferredCount: Int) throws -> [DJVULibreRenderer] {
@@ -766,272 +671,6 @@ class DJVUDocument: ObservableObject {
         }
         return result
     }
-    
-    private func findSystemExecutable(name: String) -> String? {
-        let commonPaths = [
-            "/opt/homebrew/bin/\(name)",
-            "/usr/local/bin/\(name)",
-            "/usr/bin/\(name)"
-        ]
-        
-        for path in commonPaths {
-            if FileManager.default.fileExists(atPath: path) {
-                print(" Найден \(name) по пути: \(path)")
-                return path
-            }
-        }
-        
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-        task.arguments = [name]
-        
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        
-        do {
-            try task.run()
-            task.waitUntilExit()
-            
-            if task.terminationStatus == 0 {
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !path.isEmpty {
-                    print(" Найден \(name) через which: \(path)")
-                    return path
-                }
-            }
-        } catch {
-            print("Ошибка поиска \(name): \(error)")
-        }
-        
-        print(" \(name) не найден")
-        return nil
-    }
-    
-    private func getDJVUPageCount(url: URL, djvusedPath: String) {
-        var workingURL = url
-        var needsCleanup = false
-        
-        // Проверяем, есть ли в имени файла non-ASCII символы
-        if hasNonASCIICharacters(in: url) {
-            print(" Обнаружены non-ASCII символы в имени файла, создаем временную копию")
-            if let tempURL = copyToTempWithASCIIName(originalURL: url) {
-                workingURL = tempURL
-                needsCleanup = true
-            } else {
-                DispatchQueue.main.async {
-                    self.errorMessage = "Не удалось обработать файл с русским именем"
-                }
-                return
-            }
-        }
-        
-        defer {
-            if needsCleanup {
-                try? FileManager.default.removeItem(at: workingURL)
-            }
-        }
-        
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: djvusedPath)
-        task.arguments = [workingURL.path, "-e", "n"]
-        
-        let pipe = Pipe()
-        let errorPipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = errorPipe
-        
-        do {
-            try task.run()
-            task.waitUntilExit()
-            
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            
-            if let output = String(data: data, encoding: .utf8) {
-                print("djvused output: '\(output)'")
-            }
-            if let errorOutput = String(data: errorData, encoding: .utf8), !errorOutput.isEmpty {
-                print("djvused error: '\(errorOutput)'")
-            }
-            
-            if task.terminationStatus == 0 {
-                if let output = String(data: data, encoding: .utf8) {
-                    let trimmedOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
-                    
-                    if let pages = Int(trimmedOutput) {
-                        let aspectRatios = self.fetchDJVUPageAspectRatios(
-                            url: workingURL,
-                            totalPages: pages,
-                            djvusedPath: djvusedPath
-                        )
-                        DispatchQueue.main.async {
-                            self.totalPages = pages
-                            self.continuousPageAspectRatios = aspectRatios
-                            self.continuousLayoutVersion &+= 1
-                            self.isLoaded = true
-                            print(" DJVU документ загружен, страниц: \(pages)")
-                            self.loadFirstPageOnly(0)
-                        }
-                        return
-                    }
-                    
-                    let numbers = trimmedOutput.components(separatedBy: CharacterSet.decimalDigits.inverted).compactMap { Int($0) }
-                    if let firstNumber = numbers.first, firstNumber > 0 {
-                        let aspectRatios = self.fetchDJVUPageAspectRatios(
-                            url: workingURL,
-                            totalPages: firstNumber,
-                            djvusedPath: djvusedPath
-                        )
-                        DispatchQueue.main.async {
-                            self.totalPages = firstNumber
-                            self.continuousPageAspectRatios = aspectRatios
-                            self.continuousLayoutVersion &+= 1
-                            self.isLoaded = true
-                            print(" DJVU документ загружен, страниц: \(firstNumber)")
-                            self.loadFirstPageOnly(0)
-                        }
-                        return
-                    }
-                }
-            }
-            
-            tryDirectDJVUPageLoad(url: url)
-            
-        } catch {
-            print("Ошибка запуска djvused: \(error)")
-            tryDirectDJVUPageLoad(url: url)
-        }
-    }
-    
-    private func tryDirectDJVUPageLoad(url: URL) {
-        guard let ddjvuPath = findSystemExecutable(name: "ddjvu") else {
-            DispatchQueue.main.async {
-                self.errorMessage = "ddjvu не найден для загрузки страниц"
-            }
-            return
-        }
-        
-        print("Пробуем прямую загрузку DJVU страниц...")
-        
-        var workingURL = url
-        var needsCleanup = false
-        
-        if hasNonASCIICharacters(in: url) {
-            if let tempURL = copyToTempWithASCIIName(originalURL: url) {
-                workingURL = tempURL
-                needsCleanup = true
-            }
-        }
-        
-        defer {
-            if needsCleanup {
-                try? FileManager.default.removeItem(at: workingURL)
-            }
-        }
-        
-        let tempDir = FileManager.default.temporaryDirectory
-        let tempImageURL = tempDir.appendingPathComponent("djvu_test_page_1.ppm")
-        
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: ddjvuPath)
-        task.arguments = [
-            "-format=ppm",
-            "-page=1",
-            "-scale=100",
-            workingURL.path,
-            tempImageURL.path
-        ]
-        
-        let errorPipe = Pipe()
-        task.standardError = errorPipe
-        
-        do {
-            try task.run()
-            task.waitUntilExit()
-            
-            if task.terminationStatus == 0 && FileManager.default.fileExists(atPath: tempImageURL.path) {
-                print(" Первая DJVU страница загружена успешно")
-                
-                var foundPages = 1
-                for pageNum in 2...50 {
-                    if testDJVUPageExists(url: workingURL, pageNumber: pageNum, ddjvuPath: ddjvuPath) {
-                        foundPages = pageNum
-                    } else {
-                        break
-                    }
-                }
-                
-                try? FileManager.default.removeItem(at: tempImageURL)
-
-                let aspectRatios: [Int: CGFloat]
-                if let djvusedPath = self.findSystemExecutable(name: "djvused") {
-                    aspectRatios = self.fetchDJVUPageAspectRatios(
-                        url: workingURL,
-                        totalPages: foundPages,
-                        djvusedPath: djvusedPath
-                    )
-                } else {
-                    aspectRatios = [:]
-                }
-                
-                DispatchQueue.main.async {
-                    self.totalPages = foundPages
-                    self.continuousPageAspectRatios = aspectRatios
-                    self.continuousLayoutVersion &+= 1
-                    self.isLoaded = true
-                    print(" DJVU определено страниц: \(foundPages)")
-                    self.loadFirstPageOnly(0)
-                }
-            } else {
-                try? FileManager.default.removeItem(at: tempImageURL)
-                DispatchQueue.main.async {
-                    self.errorMessage = "Не удалось загрузить DJVU файл. Проверьте его целостность."
-                }
-            }
-        } catch {
-            DispatchQueue.main.async {
-                self.errorMessage = "Ошибка при загрузке DJVU: \(error.localizedDescription)"
-            }
-        }
-    }
-    
-    private func testDJVUPageExists(url: URL, pageNumber: Int, ddjvuPath: String) -> Bool {
-        let tempDir = FileManager.default.temporaryDirectory
-        
-        let testSettings = [
-            ["-format=ppm", "-page=\(pageNumber)", "-scale=25"],
-            ["-format=png", "-page=\(pageNumber)", "-scale=25"],
-            ["-format=ppm", "-page=\(pageNumber)", "-scale=10"],
-            ["-format=ppm", "-page=\(pageNumber)", "-scale=25", "-mode=black"]
-        ]
-        
-        for settings in testSettings {
-            let format = settings.first(where: { $0.hasPrefix("-format=") })?.replacingOccurrences(of: "-format=", with: "") ?? "ppm"
-            let tempImageURL = tempDir.appendingPathComponent("djvu_test_page_\(pageNumber).\(format)")
-            
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: ddjvuPath)
-            task.arguments = settings + [url.path, tempImageURL.path]
-            
-            do {
-                try task.run()
-                task.waitUntilExit()
-                
-                let exists = task.terminationStatus == 0 && FileManager.default.fileExists(atPath: tempImageURL.path)
-                try? FileManager.default.removeItem(at: tempImageURL)
-                
-                if exists {
-                    return true
-                }
-            } catch {
-                try? FileManager.default.removeItem(at: tempImageURL)
-            }
-        }
-        
-        return false
-    }
-
     private func preparePDFContinuousLayoutMetrics(_ pdfDocument: PDFDocument) {
         var aspectRatios: [Int: CGFloat] = [:]
 
@@ -1043,78 +682,6 @@ class DJVUDocument: ObservableObject {
         }
 
         setContinuousPageAspectRatios(aspectRatios)
-    }
-
-    private func fetchDJVUPageAspectRatios(url: URL, totalPages: Int, djvusedPath: String) -> [Int: CGFloat] {
-        guard totalPages > 0 else { return [:] }
-
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: djvusedPath)
-        task.arguments = [url.path]
-
-        let inputPipe = Pipe()
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        task.standardInput = inputPipe
-        task.standardOutput = outputPipe
-        task.standardError = errorPipe
-
-        let commands = (1...totalPages)
-            .map { "select \($0)\nsize" }
-            .joined(separator: "\n") + "\n"
-
-        do {
-            try task.run()
-
-            if let commandData = commands.data(using: .utf8) {
-                inputPipe.fileHandleForWriting.write(commandData)
-            }
-            inputPipe.fileHandleForWriting.closeFile()
-            task.waitUntilExit()
-
-            guard task.terminationStatus == 0 else {
-                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-                if let errorOutput = String(data: errorData, encoding: .utf8), !errorOutput.isEmpty {
-                    print(" Не удалось получить размеры страниц DJVU: \(errorOutput)")
-                }
-                return [:]
-            }
-
-            let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else {
-                return [:]
-            }
-
-            let lines = output
-                .components(separatedBy: .newlines)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-
-            var aspectRatios: [Int: CGFloat] = [:]
-            var pageIndex = 0
-
-            for line in lines {
-                guard pageIndex < totalPages else { break }
-
-                let numbers = line
-                    .components(separatedBy: CharacterSet.decimalDigits.inverted)
-                    .compactMap(Int.init)
-
-                guard numbers.count >= 2 else { continue }
-
-                let width = CGFloat(numbers[0])
-                let height = CGFloat(numbers[1])
-                guard width > 0, height > 0 else { continue }
-
-                aspectRatios[pageIndex] = height / width
-                pageIndex += 1
-            }
-
-            return aspectRatios
-        } catch {
-            print(" Ошибка получения размеров страниц DJVU: \(error)")
-            return [:]
-        }
     }
     
     // MARK: - Page Loading (обновлено с увеличенным разрешением)
@@ -1151,8 +718,8 @@ class DJVUDocument: ObservableObject {
         backgroundQueue.async {
             if let pdfDocument = self.pdfDocument {
                 self.loadPDFPageForDisplay(pageIndex: pageIndex, pdfDocument: pdfDocument, isFirstPage: true)
-            } else if let documentURL = self.documentURL {
-                self.loadDJVUPageForDisplay(pageIndex: pageIndex, documentURL: documentURL, isFirstPage: true)
+            } else if self.djvuRenderer != nil {
+                self.loadDJVUPageForDisplay(pageIndex: pageIndex, isFirstPage: true)
             }
         }
     }
@@ -1192,8 +759,8 @@ class DJVUDocument: ObservableObject {
         backgroundQueue.async {
             if let pdfDocument = self.pdfDocument {
                 self.loadPDFPageForDisplay(pageIndex: pageIndex, pdfDocument: pdfDocument, isFirstPage: false)
-            } else if let documentURL = self.documentURL {
-                self.loadDJVUPageForDisplay(pageIndex: pageIndex, documentURL: documentURL, isFirstPage: false)
+            } else if self.djvuRenderer != nil {
+                self.loadDJVUPageForDisplay(pageIndex: pageIndex, isFirstPage: false)
             }
         }
     }
@@ -1253,7 +820,7 @@ class DJVUDocument: ObservableObject {
         }
     }
     
-    private func loadDJVUPageForDisplay(pageIndex: Int, documentURL: URL, isFirstPage: Bool) {
+    private func loadDJVUPageForDisplay(pageIndex: Int, isFirstPage: Bool) {
         if let renderedImage = renderDJVUPageUsingRenderer(
             pageIndex: pageIndex,
             pixelSize: preferredDJVUDisplayPixelSize(for: pageIndex, maxLongEdge: 3200),
@@ -1284,119 +851,11 @@ class DJVUDocument: ObservableObject {
             }
             return
         }
-
-        guard let ddjvuPath = findSystemExecutable(name: "ddjvu") else {
-            DispatchQueue.main.async {
-                self.isLoading = false
-                self.isLoadingPage = false
-                self.errorMessage = "ddjvu не найден"
-            }
-            return
-        }
-        
-        var workingURL = documentURL
-        var needsCleanup = false
-        
-        // Обрабатываем русские имена файлов
-        if hasNonASCIICharacters(in: documentURL) {
-            if let tempURL = copyToTempWithASCIIName(originalURL: documentURL) {
-                workingURL = tempURL
-                needsCleanup = true
-            }
-        }
-        
-        defer {
-            if needsCleanup {
-                try? FileManager.default.removeItem(at: workingURL)
-            }
-        }
-        
-        let tempDir = FileManager.default.temporaryDirectory
-        
-        let conversionSettings = [
-            ["-format=ppm", "-page=\(pageIndex + 1)", "-scale=400"],
-            ["-format=ppm", "-page=\(pageIndex + 1)", "-scale=350"],
-            ["-format=png", "-page=\(pageIndex + 1)", "-scale=400"],
-            ["-format=tiff", "-page=\(pageIndex + 1)", "-scale=400"],
-            ["-format=ppm", "-page=\(pageIndex + 1)", "-scale=300", "-mode=color"],
-            ["-format=ppm", "-page=\(pageIndex + 1)", "-scale=250", "-mode=black"]
-        ]
-        
-        for (attemptIndex, settings) in conversionSettings.enumerated() {
-            print("Попытка \(attemptIndex + 1)/\(conversionSettings.count) для страницы \(pageIndex + 1)")
-            
-            let format = settings.first(where: { $0.hasPrefix("-format=") })?.replacingOccurrences(of: "-format=", with: "") ?? "ppm"
-            let currentTempURL = tempDir.appendingPathComponent("djvu_page_\(pageIndex)_\(UUID().uuidString).\(format)")
-            
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: ddjvuPath)
-            task.arguments = settings + [workingURL.path, currentTempURL.path]
-            
-            let outputPipe = Pipe()
-            let errorPipe = Pipe()
-            task.standardOutput = outputPipe
-            task.standardError = errorPipe
-            
-            do {
-                try task.run()
-                task.waitUntilExit()
-                
-                if task.terminationStatus == 0 && FileManager.default.fileExists(atPath: currentTempURL.path) {
-                    if let attributes = try? FileManager.default.attributesOfItem(atPath: currentTempURL.path),
-                       let fileSize = attributes[.size] as? Int64 {
-                        
-                        if fileSize > 1000 {
-                            if let image = NSImage(contentsOf: currentTempURL) {
-                                print(" Успешно загружена страница \(pageIndex + 1)")
-                                
-                                cacheQueue.async {
-                                    self.imageCache[pageIndex] = image
-                                    self.limitCacheSize()
-                                }
-                                
-                                DispatchQueue.main.async {
-                                    if self.currentPage == pageIndex {
-                                        self.currentImage = image
-                                        self.isLoading = false
-                                        self.errorMessage = ""
-                                        print(" DJVU страница \(pageIndex + 1) отображена")
-                                        
-                                        // Если это первая страница, переключаемся на непрерывный режим
-                                        if isFirstPage {
-                                            self.setViewMode(.continuous)
-                                        }
-                                    } else {
-                                        print(" DJVU страница \(pageIndex + 1) загружена, но currentPage уже изменился на \(self.currentPage + 1)")
-                                    }
-                                    self.isLoadingPage = false
-                                }
-                                
-                                try? FileManager.default.removeItem(at: currentTempURL)
-                                
-                                if !isFirstPage {
-                                    self.schedulePreloadAdjacentPages(around: pageIndex)
-                                } else {
-                                    self.startBackgroundPreloading(from: pageIndex)
-                                }
-                                
-                                return
-                            }
-                        }
-                    }
-                }
-                
-                try? FileManager.default.removeItem(at: currentTempURL)
-                
-            } catch {
-                print(" Исключение при запуске ddjvu: \(error)")
-                try? FileManager.default.removeItem(at: currentTempURL)
-            }
-        }
         
         DispatchQueue.main.async {
             self.isLoading = false
             self.isLoadingPage = false
-            self.errorMessage = "Не удалось загрузить страницу \(pageIndex + 1). Возможно, она имеет сложную структуру."
+            self.errorMessage = "Не удалось отрисовать страницу \(pageIndex + 1) через встроенный DJVU renderer."
         }
     }
     
@@ -1522,8 +981,8 @@ class DJVUDocument: ObservableObject {
         
         if let pdfDocument = self.pdfDocument {
             self.preloadPDFPageSilently(pageIndex: pageIndex, pdfDocument: pdfDocument)
-        } else if let documentURL = self.documentURL {
-            self.preloadDJVUPageSilently(pageIndex: pageIndex, documentURL: documentURL)
+        } else if self.djvuRenderer != nil {
+            self.preloadDJVUPageSilently(pageIndex: pageIndex)
         }
     }
     
@@ -1553,7 +1012,7 @@ class DJVUDocument: ObservableObject {
         }
     }
     
-    private func preloadDJVUPageSilently(pageIndex: Int, documentURL: URL) {
+    private func preloadDJVUPageSilently(pageIndex: Int) {
         if let renderedImage = renderDJVUPageUsingRenderer(
             pageIndex: pageIndex,
             pixelSize: preferredDJVUDisplayPixelSize(for: pageIndex, maxLongEdge: 2200),
@@ -1565,53 +1024,6 @@ class DJVUDocument: ObservableObject {
                 print(" DJVU страница \(pageIndex + 1) предзагружена через libdjvu")
             }
             return
-        }
-
-        guard let ddjvuPath = findSystemExecutable(name: "ddjvu") else { return }
-        
-        var workingURL = documentURL
-        var needsCleanup = false
-        
-        if hasNonASCIICharacters(in: documentURL) {
-            if let tempURL = copyToTempWithASCIIName(originalURL: documentURL) {
-                workingURL = tempURL
-                needsCleanup = true
-            }
-        }
-        
-        defer {
-            if needsCleanup {
-                try? FileManager.default.removeItem(at: workingURL)
-            }
-        }
-        
-        let tempDir = FileManager.default.temporaryDirectory
-        let tempImageURL = tempDir.appendingPathComponent("djvu_preload_\(pageIndex)_\(UUID().uuidString).ppm")
-        
-        let settings = ["-format=ppm", "-page=\(pageIndex + 1)", "-scale=300"]
-        
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: ddjvuPath)
-        task.arguments = settings + [workingURL.path, tempImageURL.path]
-        
-        do {
-            try task.run()
-            task.waitUntilExit()
-            
-            if task.terminationStatus == 0 && FileManager.default.fileExists(atPath: tempImageURL.path) {
-                if let image = NSImage(contentsOf: tempImageURL) {
-                    cacheQueue.async {
-                        self.imageCache[pageIndex] = image
-                        self.limitCacheSize()
-                        print(" DJVU страница \(pageIndex + 1) предзагружена в кэш")
-                    }
-                }
-            }
-            
-            try? FileManager.default.removeItem(at: tempImageURL)
-        } catch {
-            print(" Ошибка предзагрузки DJVU страницы \(pageIndex + 1): \(error)")
-            try? FileManager.default.removeItem(at: tempImageURL)
         }
     }
     
@@ -1654,69 +1066,16 @@ class DJVUDocument: ObservableObject {
                 context?.restoreGState()
                 
                 thumbnailImage?.unlockFocus()
-                
-            } else if let documentURL = self.documentURL,
-                      let ddjvuPath = self.findSystemExecutable(name: "ddjvu") {
-                
-                var workingURL = documentURL
-                var needsCleanup = false
-                
-                if self.hasNonASCIICharacters(in: documentURL) {
-                    if let tempURL = self.copyToTempWithASCIIName(originalURL: documentURL) {
-                        workingURL = tempURL
-                        needsCleanup = true
-                    }
-                }
-                
-                defer {
-                    if needsCleanup {
-                        try? FileManager.default.removeItem(at: workingURL)
-                    }
-                }
-                
-                let tempDir = FileManager.default.temporaryDirectory
-                
-                let thumbnailSettings = [
-                    ["-format=ppm", "-page=\(pageIndex + 1)", "-scale=50"],
-                    ["-format=png", "-page=\(pageIndex + 1)", "-scale=50"],
-                    ["-format=ppm", "-page=\(pageIndex + 1)", "-scale=30"],
-                    ["-format=ppm", "-page=\(pageIndex + 1)", "-scale=50", "-mode=color"],
-                    ["-format=ppm", "-page=\(pageIndex + 1)", "-scale=25"]
-                ]
-                
-                for settings in thumbnailSettings {
-                    let format = settings.first(where: { $0.hasPrefix("-format=") })?.replacingOccurrences(of: "-format=", with: "") ?? "ppm"
-                    let tempImageURL = tempDir.appendingPathComponent("djvu_thumb_\(pageIndex)_\(UUID().uuidString).\(format)")
-                    
-                    let task = Process()
-                    task.executableURL = URL(fileURLWithPath: ddjvuPath)
-                    task.arguments = settings + [workingURL.path, tempImageURL.path]
-                    
-                    do {
-                        try task.run()
-                        task.waitUntilExit()
-                        
-                        if task.terminationStatus == 0 && FileManager.default.fileExists(atPath: tempImageURL.path) {
-                            if let originalImage = NSImage(contentsOf: tempImageURL) {
-                                let thumbnailSize = NSSize(width: 80, height: 120)
-                                thumbnailImage = NSImage(size: thumbnailSize)
-                                thumbnailImage?.lockFocus()
-                                originalImage.draw(in: NSRect(origin: .zero, size: thumbnailSize),
-                                                 from: NSRect(origin: .zero, size: originalImage.size),
-                                                 operation: .copy,
-                                                 fraction: 1.0)
-                                thumbnailImage?.unlockFocus()
-                                
-                                try? FileManager.default.removeItem(at: tempImageURL)
-                                break
-                            }
-                        }
-                        
-                        try? FileManager.default.removeItem(at: tempImageURL)
-                    } catch {
-                        print("Ошибка создания DJVU миниатюры: \(error)")
-                        try? FileManager.default.removeItem(at: tempImageURL)
-                    }
+
+            } else if self.djvuRenderer != nil {
+                let thumbnailSize = self.preferredDJVUThumbnailPixelSize(for: pageIndex)
+                thumbnailImage = self.renderDJVUPageUsingRenderer(
+                    pageIndex: pageIndex,
+                    pixelSize: thumbnailSize,
+                    isPreview: true
+                )
+                if thumbnailImage == nil {
+                    print("Не удалось создать DJVU миниатюру для страницы \(pageIndex + 1)")
                 }
             }
             
@@ -1728,6 +1087,26 @@ class DJVUDocument: ObservableObject {
             
             completion(thumbnailImage)
         }
+    }
+
+    private func preferredDJVUThumbnailPixelSize(for pageIndex: Int) -> CGSize {
+        let maxWidth: CGFloat = 80
+        let maxHeight: CGFloat = 120
+
+        guard let pageSize = primaryDJVUPageSize(at: pageIndex),
+              pageSize.width > 0,
+              pageSize.height > 0 else {
+            let aspectRatio = continuousPageAspectRatios[pageIndex] ?? (4.0 / 3.0)
+            let width = min(maxWidth, maxHeight / max(aspectRatio, 0.01))
+            let height = min(maxHeight, width * aspectRatio)
+            return CGSize(width: max(1, ceil(width)), height: max(1, ceil(height)))
+        }
+
+        let scale = min(maxWidth / pageSize.width, maxHeight / pageSize.height)
+        return CGSize(
+            width: max(1, ceil(pageSize.width * scale)),
+            height: max(1, ceil(pageSize.height * scale))
+        )
     }
     
     // MARK: - Navigation
