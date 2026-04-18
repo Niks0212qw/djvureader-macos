@@ -106,6 +106,13 @@ class DJVUDocument: ObservableObject {
     @Published var continuousImages: [Int: NSImage] = [:]
     @Published var continuousLoadingProgress: Double = 0.0
     @Published var isContinuousLoading: Bool = false
+    // Соотношение сторон страницы (width/height). Ключ — pageIndex.
+    // Заполняется во время открытия документа (djvused size / PDFKit bounds),
+    // чтобы placeholder'ы в LazyVStack имели ту же высоту, что и готовая
+    // страница — это устраняет скачки layout'а при подгрузке изображений.
+    @Published var pageAspectRatios: [Int: CGFloat] = [:]
+    // Дефолт на случай, если не удалось получить размеры заранее.
+    @Published var defaultPageAspectRatio: CGFloat = 0.707 // ~A4 portrait
     
     private var documentURL: URL?
     private let imageCache: NSCache<NSNumber, NSImage> = {
@@ -347,17 +354,19 @@ class DJVUDocument: ObservableObject {
         
         context?.restoreGState()
         image.unlockFocus()
-        
+
+        self.recordAspectRatio(for: pageIndex, from: image)
+
         // Сохраняем в оба места одновременно
         cacheQueue.async {
             self.imageCache[pageIndex] = image
-            
+
             DispatchQueue.main.async {
                 self.continuousImages[pageIndex] = image
             }
         }
     }
-    
+
     private func loadDJVUPageForContinuous(pageIndex: Int, documentURL: URL) {
         guard let ddjvuPath = findSystemExecutable(name: "ddjvu") else {
             print(" ddjvu не найден для загрузки страницы \(pageIndex + 1)")
@@ -395,6 +404,7 @@ class DJVUDocument: ObservableObject {
             
             if task.terminationStatus == 0 && FileManager.default.fileExists(atPath: tempImageURL.path) {
                 if let image = decodeEagerly(from: tempImageURL) {
+                    self.recordAspectRatio(for: pageIndex, from: image)
                     cacheQueue.async {
                         self.imageCache[pageIndex] = image
 
@@ -427,7 +437,27 @@ class DJVUDocument: ObservableObject {
         totalPages = pdf.pageCount
         isLoaded = true
         print(" PDF документ загружен, страниц: \(totalPages)")
-        
+
+        // Получаем размеры всех страниц из PDFKit сразу — это дешёвая операция,
+        // bounds(for:) читает метаданные, а не растеризует страницу. LazyVStack
+        // в непрерывном режиме использует эти соотношения для точной геометрии
+        // placeholder'ов, что устраняет прыжки layout'а при подгрузке картинок.
+        var aspects: [Int: CGFloat] = [:]
+        for i in 0..<pdf.pageCount {
+            if let page = pdf.page(at: i) {
+                let bounds = page.bounds(for: .mediaBox)
+                if bounds.width > 0 && bounds.height > 0 {
+                    aspects[i] = bounds.width / bounds.height
+                }
+            }
+        }
+        if !aspects.isEmpty {
+            pageAspectRatios = aspects
+            if let first = aspects[0] ?? aspects.values.first {
+                defaultPageAspectRatio = first
+            }
+        }
+
         loadFirstPageOnly(0)
     }
     
@@ -540,9 +570,14 @@ class DJVUDocument: ObservableObject {
                             print(" DJVU документ загружен, страниц: \(pages)")
                             self.loadFirstPageOnly(0)
                         }
+                        // Предзагружаем размеры всех страниц в фоне, чтобы
+                        // placeholder'ы в LazyVStack имели точный размер.
+                        self.backgroundQueue.async {
+                            self.fetchDJVUPageSizes(url: workingURL, djvusedPath: djvusedPath, totalPages: pages)
+                        }
                         return
                     }
-                    
+
                     let numbers = trimmedOutput.components(separatedBy: CharacterSet.decimalDigits.inverted).compactMap { Int($0) }
                     if let firstNumber = numbers.first, firstNumber > 0 {
                         DispatchQueue.main.async {
@@ -550,6 +585,9 @@ class DJVUDocument: ObservableObject {
                             self.isLoaded = true
                             print(" DJVU документ загружен, страниц: \(firstNumber)")
                             self.loadFirstPageOnly(0)
+                        }
+                        self.backgroundQueue.async {
+                            self.fetchDJVUPageSizes(url: workingURL, djvusedPath: djvusedPath, totalPages: firstNumber)
                         }
                         return
                     }
@@ -564,6 +602,85 @@ class DJVUDocument: ObservableObject {
         }
     }
     
+    // Обновляет pageAspectRatios по факту загрузки изображения — safety net
+    // на случай, если djvused/PDFKit не успели или не смогли предзагрузить
+    // геометрию. Вызывается после любой успешной загрузки.
+    private func recordAspectRatio(for pageIndex: Int, from image: NSImage) {
+        let aspect = image.size.width / max(image.size.height, 1)
+        guard aspect.isFinite, aspect > 0 else { return }
+        DispatchQueue.main.async {
+            if self.pageAspectRatios[pageIndex] == nil {
+                self.pageAspectRatios[pageIndex] = aspect
+            }
+            // Если defaultPageAspectRatio ещё «заводской» (~A4), переопределим
+            // по первой реально загруженной странице — остальные placeholder'ы
+            // получат её геометрию и не прыгнут.
+            if abs(self.defaultPageAspectRatio - 0.707) < 0.01, self.pageAspectRatios.count <= 1 {
+                self.defaultPageAspectRatio = aspect
+            }
+        }
+    }
+
+    // Получает размеры всех страниц одним вызовом djvused. Это позволяет
+    // LazyVStack в непрерывном режиме зарезервировать точную высоту под каждую
+    // страницу ДО загрузки её изображения — иначе при подгрузке картинки
+    // строка меняет высоту, и весь контент ниже сдвигается («прыжок» страниц).
+    private func fetchDJVUPageSizes(url: URL, djvusedPath: String, totalPages: Int) {
+        // Собираем скрипт: select 1; size; select 2; size; ...
+        var parts: [String] = []
+        parts.reserveCapacity(totalPages * 2)
+        for page in 1...totalPages {
+            parts.append("select \(page); size")
+        }
+        let script = parts.joined(separator: "; ")
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: djvusedPath)
+        task.arguments = [url.path, "-e", script]
+
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+
+        do {
+            try task.run()
+            task.waitUntilExit()
+            guard task.terminationStatus == 0 else { return }
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard let output = String(data: data, encoding: .utf8) else { return }
+
+            // Каждая строка имеет вид: "width=2550 height=3300 rotation=0"
+            var aspects: [Int: CGFloat] = [:]
+            var pageIndex = 0
+            for line in output.split(separator: "\n") {
+                var width: CGFloat = 0
+                var height: CGFloat = 0
+                for token in line.split(separator: " ") {
+                    if token.hasPrefix("width=") {
+                        width = CGFloat(Int(token.dropFirst(6)) ?? 0)
+                    } else if token.hasPrefix("height=") {
+                        height = CGFloat(Int(token.dropFirst(7)) ?? 0)
+                    }
+                }
+                if width > 0 && height > 0 && pageIndex < totalPages {
+                    aspects[pageIndex] = width / height
+                    pageIndex += 1
+                }
+            }
+
+            guard !aspects.isEmpty else { return }
+            let firstAspect = aspects[0] ?? aspects.values.first ?? 0.707
+
+            DispatchQueue.main.async {
+                self.pageAspectRatios = aspects
+                self.defaultPageAspectRatio = firstAspect
+            }
+        } catch {
+            // Не критично — поправим по первой загруженной картинке.
+        }
+    }
+
     private func tryDirectDJVUPageLoad(url: URL) {
         guard let ddjvuPath = findSystemExecutable(name: "ddjvu") else {
             DispatchQueue.main.async {
@@ -785,7 +902,9 @@ class DJVUDocument: ObservableObject {
         
         context?.restoreGState()
         image.unlockFocus()
-        
+
+        self.recordAspectRatio(for: pageIndex, from: image)
+
         cacheQueue.async {
             self.imageCache[pageIndex] = image
         }
@@ -878,6 +997,7 @@ class DJVUDocument: ObservableObject {
                         
                         if fileSize > 1000 {
                             if let image = decodeEagerly(from: currentTempURL) {
+                                self.recordAspectRatio(for: pageIndex, from: image)
                                 print(" Успешно загружена страница \(pageIndex + 1)")
                                 
                                 cacheQueue.async {

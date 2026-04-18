@@ -549,10 +549,18 @@ struct ContinuousDocumentView: View {
             ScrollView([.horizontal, .vertical], showsIndicators: true) {
                 LazyVStack(spacing: 0) {
                     ForEach(0..<djvuDocument.totalPages, id: \.self) { pageIndex in
+                        // Фиксированная геометрия страницы: известна ещё до
+                        // загрузки изображения (djvused/PDFKit при открытии
+                        // документа заполняет pageAspectRatios). Это
+                        // устраняет прыжки layout'а при подгрузке картинок.
+                        let aspect = djvuDocument.pageAspectRatios[pageIndex] ?? djvuDocument.defaultPageAspectRatio
+                        let pageWidth = geometry.size.width
+                        let pageHeight = pageWidth / max(aspect, 0.01)
                         ContinuousPageView(
                             image: djvuDocument.continuousImages[pageIndex],
                             pageIndex: pageIndex,
-                            geometry: geometry
+                            pageWidth: pageWidth,
+                            pageHeight: pageHeight
                         )
                         .equatable()
                         .id("page-\(pageIndex)")
@@ -764,45 +772,48 @@ struct PageImageView: NSViewRepresentable {
 }
 
 // MARK: - Страница в непрерывном режиме
+//
+// Страница всегда занимает фиксированную геометрию (pageWidth × pageHeight),
+// рассчитанную родителем по pageAspectRatios[pageIndex]. Это принципиально:
+// LazyVStack не вынужден пересчитывать layout при подгрузке изображения,
+// поэтому при прокрутке страницы не «прыгают» — реальная картинка
+// просто замещает placeholder внутри того же прямоугольника.
 struct ContinuousPageView: View, Equatable {
     let image: NSImage?
     let pageIndex: Int
-    let geometry: GeometryProxy
+    let pageWidth: CGFloat
+    let pageHeight: CGFloat
 
     static func == (lhs: ContinuousPageView, rhs: ContinuousPageView) -> Bool {
         lhs.pageIndex == rhs.pageIndex
             && lhs.image === rhs.image
-            && lhs.geometry.size == rhs.geometry.size
+            && lhs.pageWidth == rhs.pageWidth
+            && lhs.pageHeight == rhs.pageHeight
     }
 
     var body: some View {
-        Group {
+        ZStack {
             if let image = image {
                 PageImageView(image: image)
-                    .aspectRatio(image.size.width / max(image.size.height, 1), contentMode: .fit)
-                    .frame(maxWidth: geometry.size.width)
             } else {
-                // Плейсхолдер для загружающейся страницы в стиле Preview
+                // Placeholder на время загрузки: чистая подложка в тех же
+                // размерах + мелкий индикатор. Никаких aspectRatio, теней
+                // на SwiftUI-уровне и прочего, что пересчитывает layout.
+                Color.white
                 Rectangle()
-                    .fill(Color.secondary.opacity(0.05))
-                    .aspectRatio(0.75, contentMode: .fit)
-                    .frame(maxWidth: geometry.size.width)
-                    .overlay(
-                        VStack(spacing: 8) {
-                            ProgressView()
-                                .scaleEffect(0.8)
-                                .progressViewStyle(CircularProgressViewStyle(tint: .accentColor))
-                            
-                            Text("Страница \(pageIndex + 1)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    )
-                    .background(Color.white)
-                    .shadow(color: .black.opacity(0.1), radius: 1, x: 0, y: 1)
+                    .fill(Color.secondary.opacity(0.04))
+                VStack(spacing: 8) {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                        .progressViewStyle(CircularProgressViewStyle(tint: .accentColor))
+                    Text("Страница \(pageIndex + 1)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             }
         }
-        .padding(.vertical, 4) // Небольшое разделение между страницами как в Preview
+        .frame(width: pageWidth, height: pageHeight)
+        .padding(.vertical, 4)
     }
 }
 
