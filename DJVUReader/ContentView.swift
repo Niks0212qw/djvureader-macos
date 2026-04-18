@@ -681,6 +681,33 @@ struct ContinuousDocumentView: View {
     }
 }
 
+// MARK: - AppKit-обёртка для быстрой отрисовки страниц при скролле
+// SwiftUI `Image(nsImage:)` повторно ресемплирует большие картинки на каждом
+// кадре скролла. NSImageView вешает CGImage на CALayer и на скролл GPU просто
+// двигает слой, без перерисовки.
+struct PageImageView: NSViewRepresentable {
+    let image: NSImage
+
+    func makeNSView(context: Context) -> NSImageView {
+        let view = NSImageView()
+        view.imageScaling = .scaleProportionallyUpOrDown
+        view.imageFrameStyle = .none
+        view.isEditable = false
+        view.animates = false
+        view.wantsLayer = true
+        view.layer?.drawsAsynchronously = true
+        view.layer?.contentsGravity = .resizeAspect
+        view.image = image
+        return view
+    }
+
+    func updateNSView(_ nsView: NSImageView, context: Context) {
+        if nsView.image !== image {
+            nsView.image = image
+        }
+    }
+}
+
 // MARK: - Страница в непрерывном режиме
 struct ContinuousPageView: View, Equatable {
     let image: NSImage?
@@ -696,12 +723,11 @@ struct ContinuousPageView: View, Equatable {
     var body: some View {
         Group {
             if let image = image {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
+                PageImageView(image: image)
+                    .aspectRatio(image.size.width / max(image.size.height, 1), contentMode: .fit)
                     .frame(maxWidth: geometry.size.width)
-                    .background(Color.white) // Белый фон как в Preview
-                    .shadow(color: .black.opacity(0.1), radius: 1, x: 0, y: 1) // Тонкая тень между страницами
+                    .background(Color.white)
+                    .shadow(color: .black.opacity(0.1), radius: 1, x: 0, y: 1)
             } else {
                 // Плейсхолдер для загружающейся страницы в стиле Preview
                 Rectangle()

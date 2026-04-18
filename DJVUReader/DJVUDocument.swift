@@ -2,6 +2,21 @@ import Foundation
 import AppKit
 import PDFKit
 
+// Принудительная декомпрессия NSImage в bitmap, чтобы SwiftUI/AppKit не
+// декодировали PPM лениво во время скролла.
+func decodeEagerly(_ image: NSImage) -> NSImage {
+    var rect = NSRect(origin: .zero, size: image.size)
+    guard let cg = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) else {
+        image.cacheMode = .always
+        return image
+    }
+    let bitmap = NSBitmapImageRep(cgImage: cg)
+    let prepared = NSImage(size: image.size)
+    prepared.addRepresentation(bitmap)
+    prepared.cacheMode = .always
+    return prepared
+}
+
 private extension NSCache where KeyType == NSNumber, ObjectType == NSImage {
     subscript(key: Int) -> NSImage? {
         get { object(forKey: NSNumber(value: key)) }
@@ -331,11 +346,12 @@ class DJVUDocument: ObservableObject {
             task.waitUntilExit()
             
             if task.terminationStatus == 0 && FileManager.default.fileExists(atPath: tempImageURL.path) {
-                if let image = NSImage(contentsOf: tempImageURL) {
-                    
+                if let loaded = NSImage(contentsOf: tempImageURL) {
+                    let image = decodeEagerly(loaded)
+
                     cacheQueue.async {
                         self.imageCache[pageIndex] = image
-                        
+
                         DispatchQueue.main.async {
                             self.continuousImages[pageIndex] = image
                         }
@@ -815,7 +831,8 @@ class DJVUDocument: ObservableObject {
                        let fileSize = attributes[.size] as? Int64 {
                         
                         if fileSize > 1000 {
-                            if let image = NSImage(contentsOf: currentTempURL) {
+                            if let loaded = NSImage(contentsOf: currentTempURL) {
+                                let image = decodeEagerly(loaded)
                                 print(" Успешно загружена страница \(pageIndex + 1)")
                                 
                                 cacheQueue.async {
@@ -1030,7 +1047,8 @@ class DJVUDocument: ObservableObject {
             task.waitUntilExit()
             
             if task.terminationStatus == 0 && FileManager.default.fileExists(atPath: tempImageURL.path) {
-                if let image = NSImage(contentsOf: tempImageURL) {
+                if let loaded = NSImage(contentsOf: tempImageURL) {
+                    let image = decodeEagerly(loaded)
                     cacheQueue.async {
                         self.imageCache[pageIndex] = image
                     }
