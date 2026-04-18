@@ -1,20 +1,68 @@
 import Foundation
 import AppKit
 import PDFKit
+import CoreGraphics
+import ImageIO
 
-// Принудительная декомпрессия NSImage в bitmap, чтобы SwiftUI/AppKit не
-// декодировали PPM лениво во время скролла.
-func decodeEagerly(_ image: NSImage) -> NSImage {
-    var rect = NSRect(origin: .zero, size: image.size)
-    guard let cg = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) else {
-        image.cacheMode = .always
-        return image
+// MARK: - Pro-style image pipeline
+//
+// Профессиональные DJVU/PDF-читалки на macOS не держат ленивый NSImage в кэше —
+// они хранят уже распакованный CGImage в нативном для CoreAnimation пиксельном
+// формате. Это даёт два выигрыша при скролле:
+//   1. Распаковка PPM/PNG выполняется один раз, на фоновом потоке, в момент
+//      загрузки страницы. При выходе страницы в viewport главный поток уже не
+//      тратит время на декодирование.
+//   2. Формат пикселей (ARGB8, premultipliedFirst, little-endian) совпадает с
+//      форматом, которого ждёт CALayer — GPU заливает текстуру без промежуточной
+//      конверсии.
+//
+// `decodeEagerly(from:)` читает файл прямо через ImageIO, включает
+// shouldCacheImmediately и ещё раз рисует результат в CGContext c нативным
+// форматом, получая CGImage, указывающий на «собственную» распакованную память.
+
+func decodeEagerly(from url: URL) -> NSImage? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    let sourceOptions: [CFString: Any] = [
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceShouldCache: true
+    ]
+    guard let rawCG = CGImageSourceCreateImageAtIndex(source, 0, sourceOptions as CFDictionary) else {
+        return nil
     }
-    let bitmap = NSBitmapImageRep(cgImage: cg)
-    let prepared = NSImage(size: image.size)
-    prepared.addRepresentation(bitmap)
-    prepared.cacheMode = .always
-    return prepared
+
+    let width = rawCG.width
+    let height = rawCG.height
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
+        | CGBitmapInfo.byteOrder32Little.rawValue
+
+    guard let context = CGContext(
+        data: nil,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: 0,
+        space: colorSpace,
+        bitmapInfo: bitmapInfo
+    ) else {
+        // Fallback: оборачиваем исходный CGImage в NSImage как есть.
+        let rep = NSBitmapImageRep(cgImage: rawCG)
+        let img = NSImage(size: NSSize(width: width, height: height))
+        img.addRepresentation(rep)
+        img.cacheMode = .always
+        return img
+    }
+
+    context.interpolationQuality = .high
+    context.draw(rawCG, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+    guard let decoded = context.makeImage() else { return nil }
+
+    let rep = NSBitmapImageRep(cgImage: decoded)
+    let img = NSImage(size: NSSize(width: width, height: height))
+    img.addRepresentation(rep)
+    img.cacheMode = .always
+    return img
 }
 
 private extension NSCache where KeyType == NSNumber, ObjectType == NSImage {
@@ -346,9 +394,7 @@ class DJVUDocument: ObservableObject {
             task.waitUntilExit()
             
             if task.terminationStatus == 0 && FileManager.default.fileExists(atPath: tempImageURL.path) {
-                if let loaded = NSImage(contentsOf: tempImageURL) {
-                    let image = decodeEagerly(loaded)
-
+                if let image = decodeEagerly(from: tempImageURL) {
                     cacheQueue.async {
                         self.imageCache[pageIndex] = image
 
@@ -831,8 +877,7 @@ class DJVUDocument: ObservableObject {
                        let fileSize = attributes[.size] as? Int64 {
                         
                         if fileSize > 1000 {
-                            if let loaded = NSImage(contentsOf: currentTempURL) {
-                                let image = decodeEagerly(loaded)
+                            if let image = decodeEagerly(from: currentTempURL) {
                                 print(" Успешно загружена страница \(pageIndex + 1)")
                                 
                                 cacheQueue.async {
@@ -1047,8 +1092,7 @@ class DJVUDocument: ObservableObject {
             task.waitUntilExit()
             
             if task.terminationStatus == 0 && FileManager.default.fileExists(atPath: tempImageURL.path) {
-                if let loaded = NSImage(contentsOf: tempImageURL) {
-                    let image = decodeEagerly(loaded)
+                if let image = decodeEagerly(from: tempImageURL) {
                     cacheQueue.async {
                         self.imageCache[pageIndex] = image
                     }

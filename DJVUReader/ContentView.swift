@@ -725,6 +725,11 @@ struct PageImageView: NSViewRepresentable {
             imageLayer.contentsScale = scale
             imageLayer.minificationFilter = .trilinear
             imageLayer.magnificationFilter = .trilinear
+            // Контент уже распакован в ARGB8 premultipliedFirst little-endian
+            // (см. decodeEagerly(from:)) — это нативный формат CoreAnimation,
+            // GPU заливает текстуру без промежуточной конверсии.
+            imageLayer.contentsFormat = .RGBA8Uint
+            imageLayer.isOpaque = true
             imageLayer.drawsAsynchronously = true
             imageLayer.masksToBounds = true
             bg.addSublayer(imageLayer)
