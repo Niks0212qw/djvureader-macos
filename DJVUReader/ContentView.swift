@@ -683,27 +683,63 @@ struct ContinuousDocumentView: View {
 
 // MARK: - AppKit-обёртка для быстрой отрисовки страниц при скролле
 // SwiftUI `Image(nsImage:)` повторно ресемплирует большие картинки на каждом
-// кадре скролла. NSImageView вешает CGImage на CALayer и на скролл GPU просто
-// двигает слой, без перерисовки.
+// кадре скролла, а SwiftUI `.shadow()` создаёт offscreen-буфер размера страницы
+// — для больших картинок обе операции очень дорогие. Здесь мы вешаем CGImage
+// напрямую на CALayer и рисуем тень самим слоем: GPU при скролле только двигает
+// готовый слой.
 struct PageImageView: NSViewRepresentable {
     let image: NSImage
 
-    func makeNSView(context: Context) -> NSImageView {
-        let view = NSImageView()
-        view.imageScaling = .scaleProportionallyUpOrDown
-        view.imageFrameStyle = .none
-        view.isEditable = false
-        view.animates = false
-        view.wantsLayer = true
-        view.layer?.drawsAsynchronously = true
-        view.layer?.contentsGravity = .resizeAspect
-        view.image = image
+    final class ContainerView: NSView {
+        let imageLayer = CALayer()
+
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            wantsLayer = true
+            layerContentsRedrawPolicy = .onSetNeedsDisplay
+            let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+            let bg = CALayer()
+            bg.backgroundColor = NSColor.white.cgColor
+            bg.shadowColor = NSColor.black.cgColor
+            bg.shadowOpacity = 0.1
+            bg.shadowRadius = 1
+            bg.shadowOffset = CGSize(width: 0, height: 1)
+            bg.contentsScale = scale
+            layer = bg
+
+            imageLayer.contentsGravity = .resizeAspect
+            imageLayer.contentsScale = scale
+            imageLayer.minificationFilter = .trilinear
+            imageLayer.magnificationFilter = .trilinear
+            imageLayer.drawsAsynchronously = true
+            imageLayer.masksToBounds = true
+            bg.addSublayer(imageLayer)
+        }
+
+        required init?(coder: NSCoder) { fatalError() }
+
+        override func layout() {
+            super.layout()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            imageLayer.frame = bounds
+            CATransaction.commit()
+        }
+    }
+
+    func makeNSView(context: Context) -> ContainerView {
+        let view = ContainerView()
+        view.imageLayer.contents = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
         return view
     }
 
-    func updateNSView(_ nsView: NSImageView, context: Context) {
-        if nsView.image !== image {
-            nsView.image = image
+    func updateNSView(_ nsView: ContainerView, context: Context) {
+        let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        if (nsView.imageLayer.contents as! CGImage?) !== cg {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            nsView.imageLayer.contents = cg
+            CATransaction.commit()
         }
     }
 }
@@ -726,8 +762,6 @@ struct ContinuousPageView: View, Equatable {
                 PageImageView(image: image)
                     .aspectRatio(image.size.width / max(image.size.height, 1), contentMode: .fit)
                     .frame(maxWidth: geometry.size.width)
-                    .background(Color.white)
-                    .shadow(color: .black.opacity(0.1), radius: 1, x: 0, y: 1)
             } else {
                 // Плейсхолдер для загружающейся страницы в стиле Preview
                 Rectangle()
