@@ -254,12 +254,19 @@ struct ContentView: View {
     }
 }
 
+// Reference-хранилище для scroll offset. Мутирование не триггерит SwiftUI,
+// в отличие от @State CGPoint, который при каждом обновлении вызывает пересборку body
+// всей ContinuousDocumentView (≈60 раз/сек во время скролла).
+final class ScrollOffsetHolder {
+    var value: CGPoint = .zero
+}
+
 // MARK: - Режим непрерывного просмотра с исправленной логикой масштабирования
 struct ContinuousDocumentView: View {
     @ObservedObject var djvuDocument: DJVUDocument
     @Binding var zoomLevel: Double
     @State private var lastZoomLevel: Double = 1.0
-    @State private var scrollOffset: CGPoint = .zero
+    @State private var scrollOffsetHolder = ScrollOffsetHolder()
     @State private var lastPageUpdateTime: CFTimeInterval = 0
     // Индекс страницы, на которую currentPage был установлен в результате
     // естественного скролла. Позволяет отличить его от программной навигации
@@ -273,7 +280,6 @@ struct ContinuousDocumentView: View {
     @State private var scrollProxy: ScrollViewProxy?
     
     // Переменные для правильного зумирования с сохранением позиции
-    @State private var contentSize: CGSize = .zero
     @State private var isPerformingZoom: Bool = false
     @State private var zoomCenterPoint: CGPoint = .zero
     @State private var scrollReader: ScrollViewProxy?
@@ -358,7 +364,7 @@ struct ContinuousDocumentView: View {
     
     /// - Returns: (индекс страницы, относительная позиция внутри страницы 0.0-1.0, Y-координата начала страницы)
     private func getCurrentPageInfo() -> (pageIndex: Int, relativePosition: CGFloat, pageStartY: CGFloat) {
-        let scrollY = -scrollOffset.y
+        let scrollY = -scrollOffsetHolder.value.y
         let adjustedScrollY = max(0, scrollY)
         
         let estimatedPageHeight = viewportSize.height * 0.75 * zoomLevel + 8
@@ -409,7 +415,7 @@ struct ContinuousDocumentView: View {
         
         // Вычисляем центр текущей страницы ДО масштабирования
         let oldPageCenterY = calculatePageCenterY(for: currentPageIndex, zoom: oldZoom)
-        let currentViewCenterY = -scrollOffset.y + viewportSize.height / 2
+        let currentViewCenterY = -scrollOffsetHolder.value.y + viewportSize.height / 2
         
         // Вычисляем смещение от центра страницы до центра экрана
         let offsetFromPageCenter = currentViewCenterY - oldPageCenterY
@@ -447,7 +453,7 @@ struct ContinuousDocumentView: View {
         
 
         let targetScrollY = -(targetViewCenterY - viewportSize.height / 2)
-        let currentScrollY = scrollOffset.y
+        let currentScrollY = scrollOffsetHolder.value.y
         let offsetDelta = targetScrollY - currentScrollY
         
         print(" Центр страницы ПОСЛЕ: \(newPageCenterY)")
@@ -559,9 +565,6 @@ struct ContinuousDocumentView: View {
                         Color.clear
                             .preference(key: ScrollOffsetPreferenceKey.self,
                                       value: contentGeometry.frame(in: .named("scrollView")).origin)
-                            .onPreferenceChange(ContentSizePreferenceKey.self) { size in
-                                contentSize = size
-                            }
                     }
                 )
                 .onAppear {
@@ -591,7 +594,7 @@ struct ContinuousDocumentView: View {
             }
             .coordinateSpace(name: "scrollView")
             .onPreferenceChange(ScrollOffsetPreferenceKey.self) { value in
-                scrollOffset = value
+                scrollOffsetHolder.value = value
                 let now = CACurrentMediaTime()
                 if now - lastPageUpdateTime >= 0.1 {
                     lastPageUpdateTime = now
