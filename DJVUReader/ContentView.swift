@@ -364,16 +364,29 @@ private struct ContinuousScrollViewRepresentable: NSViewRepresentable {
             let relativeY: CGFloat
         }
 
+        private struct RenderSignature: Equatable {
+            let startIndex: Int
+            let endIndex: Int
+            let magnificationKey: Int
+            let isInteracting: Bool
+            let layoutVersion: Int
+            let documentWidthKey: Int
+        }
+
         var parent: ContinuousScrollViewRepresentable
         let documentView = ContinuousPagesDocumentView()
 
         private weak var scrollView: ContinuousHostingScrollView?
         private var boundsObserver: NSObjectProtocol?
+        private var liveScrollStartObserver: NSObjectProtocol?
+        private var liveScrollEndObserver: NSObjectProtocol?
         private var isUpdatingPageFromScroll = false
         private var isApplyingZoom = false
         private var lastViewportWidth: CGFloat = 0
-        private var lastLoadedPageCount = 0
+        private var lastLayoutVersion = 0
         private var lastAppliedCurrentPage: Int?
+        private var lastRenderSignature: RenderSignature?
+        private var renderRequestWorkItem: DispatchWorkItem?
 
         init(parent: ContinuousScrollViewRepresentable) {
             self.parent = parent
@@ -391,6 +404,26 @@ private struct ContinuousScrollViewRepresentable: NSViewRepresentable {
             ) { [weak self] _ in
                 self?.handleScrollOrMagnificationChange()
             }
+
+            liveScrollStartObserver = NotificationCenter.default.addObserver(
+                forName: NSScrollView.willStartLiveScrollNotification,
+                object: scrollView,
+                queue: .main
+            ) { [weak self] _ in
+                self?.documentView.setLiveScrolling(true)
+                self?.scheduleVisiblePageRendering(force: true)
+            }
+
+            liveScrollEndObserver = NotificationCenter.default.addObserver(
+                forName: NSScrollView.didEndLiveScrollNotification,
+                object: scrollView,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self, let scrollView = self.scrollView else { return }
+                self.documentView.setLiveScrolling(false)
+                self.documentView.setNeedsDisplay(scrollView.contentView.bounds)
+                self.scheduleVisiblePageRendering(force: true)
+            }
         }
 
         func detach() {
@@ -398,6 +431,16 @@ private struct ContinuousScrollViewRepresentable: NSViewRepresentable {
                 NotificationCenter.default.removeObserver(boundsObserver)
                 self.boundsObserver = nil
             }
+            if let liveScrollStartObserver {
+                NotificationCenter.default.removeObserver(liveScrollStartObserver)
+                self.liveScrollStartObserver = nil
+            }
+            if let liveScrollEndObserver {
+                NotificationCenter.default.removeObserver(liveScrollEndObserver)
+                self.liveScrollEndObserver = nil
+            }
+            renderRequestWorkItem?.cancel()
+            renderRequestWorkItem = nil
             scrollView = nil
         }
 
@@ -413,12 +456,14 @@ private struct ContinuousScrollViewRepresentable: NSViewRepresentable {
             documentView.updateContent(
                 totalPages: parent.djvuDocument.totalPages,
                 images: parent.djvuDocument.continuousImages,
+                pageAspectRatios: parent.djvuDocument.continuousPageAspectRatios,
+                layoutVersion: parent.djvuDocument.continuousLayoutVersion,
                 viewportWidth: max(parent.viewportSize.width, 1),
                 magnification: clampedZoom
             )
 
             lastViewportWidth = parent.viewportSize.width
-            lastLoadedPageCount = parent.djvuDocument.continuousImages.count
+            lastLayoutVersion = parent.djvuDocument.continuousLayoutVersion
 
             if let preservedAnchor, !zoomWillChange {
                 restoreReadingAnchor(preservedAnchor, animated: false)
@@ -431,11 +476,13 @@ private struct ContinuousScrollViewRepresentable: NSViewRepresentable {
             if !isUpdatingPageFromScroll {
                 scrollToRequestedPageIfNeeded(parent.djvuDocument.currentPage, animated: animatedPageNavigation)
             }
+
+            scheduleVisiblePageRendering()
         }
 
         private func shouldRestoreAnchorForLayoutChange(parent: ContinuousScrollViewRepresentable) -> Bool {
             abs(lastViewportWidth - parent.viewportSize.width) > 0.5 ||
-            lastLoadedPageCount != parent.djvuDocument.continuousImages.count
+            lastLayoutVersion != parent.djvuDocument.continuousLayoutVersion
         }
 
         private func captureReadingAnchor() -> ReadingAnchor? {
@@ -565,6 +612,72 @@ private struct ContinuousScrollViewRepresentable: NSViewRepresentable {
                     parent.zoomLevel = magnification
                 }
             }
+
+            scheduleVisiblePageRendering()
+        }
+
+        private func scheduleVisiblePageRendering(force: Bool = false) {
+            renderRequestWorkItem?.cancel()
+
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.requestVisiblePageRendering(force: force)
+            }
+            renderRequestWorkItem = workItem
+
+            let delay: TimeInterval = force ? 0 : (documentView.isCurrentlyLiveScrolling ? 0.03 : 0.01)
+            if delay == 0 {
+                workItem.perform()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+            }
+        }
+
+        private func requestVisiblePageRendering(force: Bool) {
+            guard let scrollView else { return }
+
+            let visibleRect = scrollView.contentView.bounds
+            let highPriorityPadding = documentView.isCurrentlyLiveScrolling ? 1 : 0
+            let highPriorityStartIndex = max(0, documentView.pageIndex(at: visibleRect.minY) - highPriorityPadding)
+            let highPriorityEndIndex = min(parent.djvuDocument.totalPages - 1, documentView.pageIndex(at: visibleRect.maxY) + highPriorityPadding)
+            let highPriorityPages = highPriorityStartIndex <= highPriorityEndIndex
+                ? Set(highPriorityStartIndex...highPriorityEndIndex)
+                : []
+
+            let verticalPrefetchSpan = visibleRect.height * (documentView.isCurrentlyLiveScrolling ? 2.5 : 2.0)
+            let bufferedRect = visibleRect.insetBy(dx: 0, dy: -verticalPrefetchSpan)
+            let pagePrefetchPadding = documentView.isCurrentlyLiveScrolling ? 8 : 5
+            let startIndex = max(0, documentView.pageIndex(at: bufferedRect.minY) - pagePrefetchPadding)
+            let endIndex = min(parent.djvuDocument.totalPages - 1, documentView.pageIndex(at: bufferedRect.maxY) + pagePrefetchPadding)
+            guard endIndex >= startIndex else { return }
+
+            var pageSizes: [Int: CGSize] = [:]
+            for pageIndex in startIndex...endIndex {
+                guard let pageFrame = documentView.pageFrame(for: pageIndex) else { continue }
+                pageSizes[pageIndex] = pageFrame.size
+            }
+
+            let hasAllRequestedImages = pageSizes.keys.allSatisfy { parent.djvuDocument.continuousImages[$0] != nil }
+
+            let signature = RenderSignature(
+                startIndex: startIndex,
+                endIndex: endIndex,
+                magnificationKey: Int((scrollView.magnification * 1000).rounded()),
+                isInteracting: documentView.isCurrentlyLiveScrolling,
+                layoutVersion: parent.djvuDocument.continuousLayoutVersion,
+                documentWidthKey: Int(documentView.bounds.width.rounded())
+            )
+            if !force, signature == lastRenderSignature, hasAllRequestedImages {
+                return
+            }
+            lastRenderSignature = signature
+
+            parent.djvuDocument.updateContinuousVisiblePages(
+                pageSizes: pageSizes,
+                highPriorityPages: highPriorityPages,
+                magnification: scrollView.magnification,
+                backingScale: scrollView.window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2,
+                isInteracting: documentView.isCurrentlyLiveScrolling
+            )
         }
     }
 }
@@ -577,72 +690,118 @@ private final class ContinuousPagesDocumentView: NSView {
     private static let verticalSpacing: CGFloat = 8
     fileprivate static let placeholderAspectRatio: CGFloat = 0.75
 
-    private var pageViews: [Int: ContinuousPageItemView] = [:]
-    private var pageFrames: [Int: CGRect] = [:]
+    private var pageFrames: [CGRect] = []
+    private var pageImages: [Int: NSImage] = [:]
+    private var lastViewportWidth: CGFloat = 0
+    private var lastMagnification: CGFloat = 1
+    private var lastTotalPages: Int = 0
+    private var lastLayoutVersion: Int = 0
+    private var pageAspectRatios: [Int: CGFloat] = [:]
+    private var knownLoadedPages = Set<Int>()
+    private var isLiveScrolling = false
 
     override var isFlipped: Bool { true }
 
-    func updateContent(totalPages: Int, images: [Int: NSImage], viewportWidth: CGFloat, magnification: CGFloat) {
-        syncPageViews(totalPages: totalPages)
+    func updateContent(
+        totalPages: Int,
+        images: [Int: NSImage],
+        pageAspectRatios: [Int: CGFloat],
+        layoutVersion: Int,
+        viewportWidth: CGFloat,
+        magnification: CGFloat
+    ) {
+        let previousLoadedPages = knownLoadedPages
+        let requiresLayout = totalPages != lastTotalPages ||
+            abs(lastViewportWidth - viewportWidth) > 0.5 ||
+            abs(lastMagnification - magnification) > 0.001 ||
+            lastLayoutVersion != layoutVersion
 
-        for pageIndex in 0..<totalPages {
-            pageViews[pageIndex]?.update(
-                image: images[pageIndex],
-                pageIndex: pageIndex
-            )
+        if totalPages != lastTotalPages {
+            pageImages.removeAll()
         }
 
-        layoutPages(totalPages: totalPages, viewportWidth: viewportWidth, magnification: magnification)
+        self.pageAspectRatios = pageAspectRatios
+        pageImages = images
+        knownLoadedPages = Set(images.keys)
+
+        lastViewportWidth = viewportWidth
+        lastMagnification = magnification
+        lastTotalPages = totalPages
+        lastLayoutVersion = layoutVersion
+
+        if requiresLayout {
+            layoutPages(totalPages: totalPages, viewportWidth: viewportWidth, magnification: magnification)
+            needsDisplay = true
+        } else {
+            let changedPages = Set(images.keys).symmetricDifference(previousLoadedPages)
+            for pageIndex in changedPages {
+                if let pageFrame = pageFrame(for: pageIndex) {
+                    setNeedsDisplay(pageFrame)
+                }
+            }
+        }
     }
 
     func pageFrame(for pageIndex: Int) -> CGRect? {
-        pageFrames[pageIndex]
+        guard pageIndex >= 0 && pageIndex < pageFrames.count else { return nil }
+        return pageFrames[pageIndex]
+    }
+
+    func setLiveScrolling(_ isLiveScrolling: Bool) {
+        guard self.isLiveScrolling != isLiveScrolling else { return }
+        self.isLiveScrolling = isLiveScrolling
+        needsDisplay = true
+    }
+
+    var isCurrentlyLiveScrolling: Bool {
+        isLiveScrolling
     }
 
     func pageIndex(at y: CGFloat) -> Int {
-        let sortedFrames = pageFrames.sorted { $0.key < $1.key }
+        guard !pageFrames.isEmpty else { return 0 }
 
-        if let containing = sortedFrames.first(where: { _, frame in
-            y >= frame.minY && y <= frame.maxY
-        }) {
-            return containing.key
+        var low = 0
+        var high = pageFrames.count - 1
+        var nearestIndex = 0
+        var nearestDistance = CGFloat.greatestFiniteMagnitude
+
+        while low <= high {
+            let mid = (low + high) / 2
+            let frame = pageFrames[mid]
+
+            if y < frame.minY {
+                let distance = frame.minY - y
+                if distance < nearestDistance {
+                    nearestDistance = distance
+                    nearestIndex = mid
+                }
+                high = mid - 1
+            } else if y > frame.maxY {
+                let distance = y - frame.maxY
+                if distance < nearestDistance {
+                    nearestDistance = distance
+                    nearestIndex = mid
+                }
+                low = mid + 1
+            } else {
+                return mid
+            }
         }
 
-        if let nearest = sortedFrames.min(by: { lhs, rhs in
-            abs(lhs.value.midY - y) < abs(rhs.value.midY - y)
-        }) {
-            return nearest.key
-        }
-
-        return 0
-    }
-
-    private func syncPageViews(totalPages: Int) {
-        let existingKeys = Set(pageViews.keys)
-        let requiredKeys = Set(0..<totalPages)
-
-        for pageIndex in existingKeys.subtracting(requiredKeys) {
-            pageViews[pageIndex]?.removeFromSuperview()
-            pageViews[pageIndex] = nil
-        }
-
-        for pageIndex in requiredKeys.subtracting(existingKeys) {
-            let pageView = ContinuousPageItemView()
-            addSubview(pageView)
-            pageViews[pageIndex] = pageView
-        }
+        return nearestIndex
     }
 
     private func layoutPages(totalPages: Int, viewportWidth: CGFloat, magnification: CGFloat) {
         let pageWidth = max(viewportWidth, 1)
         let contentWidth = magnification < 1 ? max(pageWidth / magnification, pageWidth) : pageWidth
-        var frames: [Int: CGRect] = [:]
+        var frames = Array(repeating: CGRect.zero, count: totalPages)
         var currentY: CGFloat = 0
 
         for pageIndex in 0..<totalPages {
-            guard let pageView = pageViews[pageIndex] else { continue }
-
-            let pageSize = pageView.preferredSize(forWidth: pageWidth)
+            let pageSize = Self.preferredPageSize(
+                forWidth: pageWidth,
+                aspectRatio: pageAspectRatios[pageIndex] ?? (1 / Self.placeholderAspectRatio)
+            )
             let frame = CGRect(
                 x: (contentWidth - pageSize.width) / 2,
                 y: currentY,
@@ -650,7 +809,6 @@ private final class ContinuousPagesDocumentView: NSView {
                 height: pageSize.height
             )
 
-            pageView.frame = frame
             frames[pageIndex] = frame
             currentY = frame.maxY + Self.verticalSpacing
         }
@@ -662,84 +820,81 @@ private final class ContinuousPagesDocumentView: NSView {
         pageFrames = frames
         frame = CGRect(origin: .zero, size: CGSize(width: contentWidth, height: max(1, currentY)))
     }
-}
 
-private final class ContinuousPageItemView: NSView {
-    private let imageView = NSImageView()
-    private let placeholderView = NSView()
-    private let progressIndicator = NSProgressIndicator()
-    private let titleLabel = NSTextField(labelWithString: "")
-    private var image: NSImage?
-
-    override var isFlipped: Bool { true }
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.white.cgColor
-        layer?.shadowColor = NSColor.black.withAlphaComponent(0.1).cgColor
-        layer?.shadowOpacity = 1
-        layer?.shadowRadius = 1
-        layer?.shadowOffset = CGSize(width: 0, height: 1)
-
-        imageView.imageScaling = .scaleAxesIndependently
-        imageView.imageAlignment = .alignCenter
-        imageView.wantsLayer = true
-        addSubview(imageView)
-
-        placeholderView.wantsLayer = true
-        placeholderView.layer?.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.05).cgColor
-        addSubview(placeholderView)
-
-        progressIndicator.style = .spinning
-        progressIndicator.controlSize = .small
-        progressIndicator.startAnimation(nil)
-        placeholderView.addSubview(progressIndicator)
-
-        titleLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        titleLabel.textColor = .secondaryLabelColor
-        titleLabel.alignment = .center
-        placeholderView.addSubview(titleLabel)
+    private static func preferredPageSize(forWidth width: CGFloat, aspectRatio: CGFloat) -> CGSize {
+        CGSize(width: width, height: max(1, width * aspectRatio))
     }
 
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        guard lastTotalPages > 0 else { return }
+
+        if let context = NSGraphicsContext.current {
+            context.imageInterpolation = isLiveScrolling ? .low : .high
+        }
+
+        NSColor.windowBackgroundColor.setFill()
+        dirtyRect.fill()
+
+        let startIndex = max(0, pageIndex(at: dirtyRect.minY))
+        let endIndex = min(lastTotalPages - 1, pageIndex(at: dirtyRect.maxY))
+        guard endIndex >= startIndex else { return }
+
+        for pageIndex in startIndex...endIndex {
+            let pageFrame = pageFrames[pageIndex]
+            guard pageFrame.intersects(dirtyRect) else { continue }
+
+            drawPageBackground(in: pageFrame)
+
+            if let image = pageImages[pageIndex] {
+                image.draw(
+                    in: pageFrame,
+                    from: .zero,
+                    operation: .sourceOver,
+                    fraction: 1.0,
+                    respectFlipped: true,
+                    hints: nil
+                )
+            } else {
+                drawPlaceholder(in: pageFrame, pageIndex: pageIndex)
+            }
+        }
     }
 
-    func update(image: NSImage?, pageIndex: Int) {
-        self.image = image
-        imageView.image = image
-        imageView.isHidden = image == nil
-        placeholderView.isHidden = image != nil
-        titleLabel.stringValue = "Страница \(pageIndex + 1)"
-        needsLayout = true
+    private func drawPageBackground(in rect: CGRect) {
+        if !isLiveScrolling {
+            let shadowRect = rect.offsetBy(dx: 0, dy: 1)
+            NSColor.black.withAlphaComponent(0.08).setFill()
+            shadowRect.fill()
+        }
+
+        NSColor.white.setFill()
+        rect.fill()
     }
 
-    func preferredSize(forWidth width: CGFloat) -> CGSize {
-        let aspectRatio = image.map { $0.size.height / max($0.size.width, 1) } ??
-            (1 / ContinuousPagesDocumentView.placeholderAspectRatio)
-        return CGSize(width: width, height: max(1, width * aspectRatio))
-    }
+    private func drawPlaceholder(in rect: CGRect, pageIndex: Int) {
+        NSColor.secondaryLabelColor.withAlphaComponent(0.05).setFill()
+        rect.fill()
 
-    override func layout() {
-        super.layout()
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = .center
 
-        imageView.frame = bounds
-        placeholderView.frame = bounds
-        progressIndicator.sizeToFit()
-        progressIndicator.frame.origin = CGPoint(
-            x: (bounds.width - progressIndicator.frame.width) / 2,
-            y: max(20, bounds.height * 0.42 - progressIndicator.frame.height)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: paragraphStyle
+        ]
+
+        let title = NSString(string: "Страница \(pageIndex + 1)")
+        let titleSize = title.size(withAttributes: attributes)
+        let titleRect = CGRect(
+            x: rect.minX,
+            y: rect.midY - titleSize.height / 2,
+            width: rect.width,
+            height: titleSize.height
         )
-        titleLabel.sizeToFit()
-        titleLabel.frame = CGRect(
-            x: 0,
-            y: progressIndicator.frame.maxY + 8,
-            width: bounds.width,
-            height: titleLabel.frame.height
-        )
+        title.draw(in: titleRect, withAttributes: attributes)
     }
 }
 

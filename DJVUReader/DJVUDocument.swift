@@ -18,6 +18,68 @@ enum ViewMode: String, CaseIterable, Identifiable {
 }
 
 class DJVUDocument: ObservableObject {
+    private struct ContinuousRenderRequest: Hashable {
+        let generation: UInt64
+        let pageIndex: Int
+        let pixelSize: CGSize
+        let isPreview: Bool
+        let attempt: Int
+
+        private var pixelArea: CGFloat {
+            pixelSize.width * pixelSize.height
+        }
+
+        var cacheKey: String {
+            "\(pageIndex)-\(Int(pixelSize.width))x\(Int(pixelSize.height))-\(isPreview ? "preview" : "full")"
+        }
+
+        func isHigherPriority(than other: ContinuousRenderRequest) -> Bool {
+            if generation != other.generation {
+                return generation > other.generation
+            }
+
+            if isPreview != other.isPreview {
+                return !isPreview
+            }
+
+            return pixelArea > other.pixelArea * 1.02
+        }
+    }
+
+    private struct ContinuousRenderedPage {
+        let image: NSImage
+        let pixelSize: CGSize
+        let isPreview: Bool
+
+        private var pixelArea: CGFloat {
+            pixelSize.width * pixelSize.height
+        }
+
+        func satisfies(_ request: ContinuousRenderRequest) -> Bool {
+            let widthOkay = pixelSize.width >= request.pixelSize.width * 0.98
+            let heightOkay = pixelSize.height >= request.pixelSize.height * 0.98
+
+            if request.isPreview {
+                return widthOkay && heightOkay
+            }
+
+            return !isPreview && widthOkay && heightOkay
+        }
+
+        func isBetter(than other: ContinuousRenderedPage) -> Bool {
+            if isPreview != other.isPreview {
+                return !isPreview
+            }
+
+            return pixelArea > other.pixelArea * 1.05
+        }
+    }
+
+    private struct DJVURendererSlot {
+        let renderer: DJVULibreRenderer
+        let queue: DispatchQueue
+    }
+
     @Published var currentPage: Int = 0
     @Published var totalPages: Int = 0
     @Published var currentImage: NSImage?
@@ -30,21 +92,35 @@ class DJVUDocument: ObservableObject {
     @Published var continuousImages: [Int: NSImage] = [:]
     @Published var continuousLoadingProgress: Double = 0.0
     @Published var isContinuousLoading: Bool = false
+    @Published private(set) var continuousPageAspectRatios: [Int: CGFloat] = [:]
+    @Published private(set) var continuousLayoutVersion: Int = 0
+
+    private let continuousRetentionPadding = 6
     
     private var documentURL: URL?
     private var imageCache: [Int: NSImage] = [:]
     private var thumbnailCache: [Int: NSImage] = [:]
     private var pdfDocument: PDFDocument?
+    private var djvuRenderer: DJVULibreRenderer?
+    private var djvuRendererSlots: [DJVURendererSlot] = []
     
     private var isLoadingPage: Bool = false
     private var preloadQueue = Set<Int>()
     private var completedPreloads: Int = 0
-    private var continuousLoadingQueue = Set<Int>()
+    private var lastPublishedBackgroundProgress: Double = 0.0
+    private var continuousRenderedPages: [Int: ContinuousRenderedPage] = [:]
+    private var continuousVisiblePages = Set<Int>()
+    private var continuousPendingRequests: [Int: ContinuousRenderRequest] = [:]
+    private var continuousInFlightPages = Set<Int>()
+    private var continuousRenderGeneration: UInt64 = 0
+    private let continuousStateQueue = DispatchQueue(label: "djvu.continuous.state", qos: .userInitiated)
+    private let continuousRenderSemaphore = DispatchSemaphore(value: 3)
     
     private let backgroundQueue = DispatchQueue(label: "djvu.background", qos: .userInitiated)
     private let cacheQueue = DispatchQueue(label: "djvu.cache", qos: .utility)
     private let preloadQueue_dispatch = DispatchQueue(label: "djvu.preload", qos: .utility)
-    private let continuousQueue = DispatchQueue(label: "djvu.continuous", qos: .userInitiated)
+    private let continuousRenderQueue = DispatchQueue(label: "djvu.continuous.render", qos: .utility, attributes: .concurrent)
+    private let djvuRendererQueue = DispatchQueue(label: "djvu.renderer.queue", qos: .userInitiated)
     
     private func copyToTempWithASCIIName(originalURL: URL) -> URL? {
         let tempDir = FileManager.default.temporaryDirectory
@@ -82,14 +158,28 @@ class DJVUDocument: ObservableObject {
             self.continuousImages.removeAll()
             self.continuousLoadingProgress = 0.0
             self.isContinuousLoading = false
+            self.lastPublishedBackgroundProgress = 0.0
+            self.continuousPageAspectRatios.removeAll()
+            self.continuousLayoutVersion &+= 1
         }
+
+        pdfDocument = nil
+        djvuRenderer = nil
+        djvuRendererSlots = []
         
         // Очищаем кэш в фоне
         cacheQueue.async {
             self.imageCache.removeAll()
             self.thumbnailCache.removeAll()
             self.preloadQueue.removeAll()
-            self.continuousLoadingQueue.removeAll()
+        }
+
+        continuousStateQueue.async {
+            self.continuousRenderedPages.removeAll()
+            self.continuousVisiblePages.removeAll()
+            self.continuousPendingRequests.removeAll()
+            self.continuousInFlightPages.removeAll()
+            self.continuousRenderGeneration &+= 1
         }
         
         guard url.startAccessingSecurityScopedResource() else {
@@ -125,256 +215,506 @@ class DJVUDocument: ObservableObject {
             self.viewMode = mode
             
             if mode == .continuous {
-                print(" Текущий кэш содержит \(self.imageCache.count) страниц")
-                print(" continuousImages содержит \(self.continuousImages.count) страниц")
-                
-                // Очищаем и заново заполняем continuousImages
-                self.continuousImages.removeAll()
-                
-                // Сначала заполняем continuousImages из кэша
+                self.clearContinuousViewportCache()
                 self.populateContinuousFromCache()
-                
-                print(" После заполнения из кэша: continuousImages содержит \(self.continuousImages.count) страниц")
-                
-                // Принудительно обновляем UI несколько раз
-                DispatchQueue.main.async {
-                    self.objectWillChange.send()
-                }
-                
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    self.objectWillChange.send()
-                }
-                
-                self.loadAllPagesForContinuousView()
+            } else {
+                self.clearContinuousViewportCache()
             }
         }
     }
     
     private func populateContinuousFromCache() {
-        var addedCount = 0
-        for pageIndex in 0..<totalPages {
-            if let image = imageCache[pageIndex] {
-                continuousImages[pageIndex] = image
-                addedCount += 1
-                print(" Добавили страницу \(pageIndex + 1) из кэша")
-            }
+        var restoredImages: [Int: NSImage] = [:]
+
+        let candidatePages = [currentPage - 1, currentPage, currentPage + 1]
+            .filter { $0 >= 0 && $0 < totalPages }
+
+        for pageIndex in candidatePages {
+            guard let image = imageCache[pageIndex] else { continue }
+            restoredImages[pageIndex] = image
         }
-        print(" Добавлено \(addedCount) страниц из кэша в continuousImages")
-        print(" Общее количество в continuousImages: \(continuousImages.count)")
-        
 
         DispatchQueue.main.async {
-            self.objectWillChange.send()
+            self.continuousImages = restoredImages
+        }
+    }
+
+    private func setContinuousPageAspectRatios(_ aspectRatios: [Int: CGFloat]) {
+        let applyChanges = {
+            self.continuousPageAspectRatios = aspectRatios
+            self.continuousLayoutVersion &+= 1
+        }
+
+        if Thread.isMainThread {
+            applyChanges()
+        } else {
+            DispatchQueue.main.async(execute: applyChanges)
         }
     }
     
     // MARK: - Непрерывный просмотр
-    private func loadAllPagesForContinuousView() {
-        print(" Начинаем загрузку всех страниц для непрерывного просмотра")
-        print(" Уже загружено: \(continuousImages.count)/\(totalPages) страниц")
-        
-        let pagesToLoad = (0..<totalPages).filter { pageIndex in
-            continuousImages[pageIndex] == nil
-        }
-        
-        if pagesToLoad.isEmpty {
-            print(" Все страницы уже загружены для непрерывного просмотра")
+    func updateContinuousVisiblePages(
+        pageSizes: [Int: CGSize],
+        highPriorityPages: Set<Int>,
+        magnification: CGFloat,
+        backingScale: CGFloat,
+        isInteracting: Bool
+    ) {
+        guard viewMode == .continuous else { return }
+
+        let requestedPages = Set(pageSizes.keys)
+        let keepPages = retainedContinuousPages(around: requestedPages.union([currentPage]))
+        let resolvedBackingScale = max(backingScale, 1)
+        let resolvedMagnification = max(magnification, 0.5)
+
+        continuousStateQueue.async {
+            self.continuousRenderGeneration &+= 1
+            let generation = self.continuousRenderGeneration
+            self.continuousVisiblePages = keepPages
+            self.pruneContinuousRenderedPages(keeping: keepPages)
+            self.continuousPendingRequests = self.continuousPendingRequests.filter { keepPages.contains($0.key) }
+
             DispatchQueue.main.async {
-                self.isContinuousLoading = false
-                self.continuousLoadingProgress = 1.0
+                self.prunePublishedContinuousImages(keeping: keepPages)
             }
-            return
+
+            guard !pageSizes.isEmpty else {
+                self.publishContinuousLoadingStateLocked()
+                return
+            }
+
+            let sortedPageIndices = pageSizes.keys.sorted { lhs, rhs in
+                let lhsHighPriority = highPriorityPages.contains(lhs)
+                let rhsHighPriority = highPriorityPages.contains(rhs)
+                if lhsHighPriority != rhsHighPriority {
+                    return lhsHighPriority && !rhsHighPriority
+                }
+
+                let lhsDistance = abs(lhs - self.currentPage)
+                let rhsDistance = abs(rhs - self.currentPage)
+                if lhsDistance != rhsDistance {
+                    return lhsDistance < rhsDistance
+                }
+
+                return lhs < rhs
+            }
+
+            for pageIndex in sortedPageIndices {
+                guard let pageSize = pageSizes[pageIndex] else { continue }
+                let request = self.makeContinuousRenderRequest(
+                    generation: generation,
+                    pageIndex: pageIndex,
+                    pageSize: pageSize,
+                    magnification: resolvedMagnification,
+                    backingScale: resolvedBackingScale,
+                    isPreview: false
+                )
+                self.scheduleContinuousRenderLocked(request)
+            }
+
+            self.publishContinuousLoadingStateLocked()
         }
-        
+    }
+    
+    private func clearContinuousViewportCache() {
+        continuousStateQueue.async {
+            self.continuousRenderedPages.removeAll()
+            self.continuousVisiblePages.removeAll()
+            self.continuousPendingRequests.removeAll()
+            self.continuousInFlightPages.removeAll()
+            self.continuousRenderGeneration &+= 1
+            self.publishContinuousLoadingStateLocked()
+        }
+
         DispatchQueue.main.async {
-            self.isContinuousLoading = true
-            self.continuousLoadingProgress = Double(self.continuousImages.count) / Double(self.totalPages)
+            self.continuousImages.removeAll()
+            self.continuousLoadingProgress = 0
         }
-        
-        continuousQueue.async {
-            let batchSize = 3 // Загружаем по 3 страницы одновременно
-            let totalBatches = (pagesToLoad.count + batchSize - 1) / batchSize
-            
-            for batchIndex in 0..<totalBatches {
-                let startIndex = batchIndex * batchSize
-                let endIndex = min(startIndex + batchSize, pagesToLoad.count)
-                let batchPages = Array(pagesToLoad[startIndex..<endIndex])
-                
-                let group = DispatchGroup()
-                
-                for pageIndex in batchPages {
-                    group.enter()
-                    self.backgroundQueue.async {
-                        self.loadPageForContinuous(pageIndex: pageIndex) {
-                            group.leave()
-                        }
-                    }
-                }
-                
-                group.wait()
-                
-                DispatchQueue.main.async {
-                    let loadedCount = self.continuousImages.count
-                    self.continuousLoadingProgress = Double(loadedCount) / Double(self.totalPages)
-                    print(" Прогресс загрузки: \(loadedCount)/\(self.totalPages)")
-                }
-                
-                // Небольшая пауза между батчами
-                Thread.sleep(forTimeInterval: 0.1)
+    }
+
+    private func retainedContinuousPages(around seedPages: Set<Int>) -> Set<Int> {
+        guard totalPages > 0, !seedPages.isEmpty else { return seedPages }
+
+        var retainedPages = seedPages
+        for pageIndex in seedPages {
+            let lowerBound = max(0, pageIndex - continuousRetentionPadding)
+            let upperBound = min(totalPages - 1, pageIndex + continuousRetentionPadding)
+            for neighbor in lowerBound...upperBound {
+                retainedPages.insert(neighbor)
             }
-            
-            DispatchQueue.main.async {
-                self.isContinuousLoading = false
-                self.continuousLoadingProgress = 1.0
-                print(" Все страницы загружены для непрерывного просмотра: \(self.continuousImages.count)/\(self.totalPages)")
+        }
+
+        return retainedPages
+    }
+
+    private func makeContinuousRenderRequest(
+        generation: UInt64,
+        pageIndex: Int,
+        pageSize: CGSize,
+        magnification: CGFloat,
+        backingScale: CGFloat,
+        isPreview: Bool
+    ) -> ContinuousRenderRequest {
+        let previewScale: CGFloat = isPreview ? 0.45 : 1.0
+        let minimumWidth = isPreview ? 220 : 320
+        let pixelWidth = max(minimumWidth, Int(ceil(min(pageSize.width * magnification * backingScale * previewScale, 4096))))
+        let aspectRatio = continuousPageAspectRatios[pageIndex] ?? (pageSize.height / max(pageSize.width, 1))
+        let pixelHeight = max(1, Int(ceil(min(CGFloat(pixelWidth) * aspectRatio, 4096))))
+
+        return ContinuousRenderRequest(
+            generation: generation,
+            pageIndex: pageIndex,
+            pixelSize: CGSize(width: pixelWidth, height: pixelHeight),
+            isPreview: isPreview,
+            attempt: 0
+        )
+    }
+
+    private func scheduleContinuousRenderLocked(_ request: ContinuousRenderRequest) {
+        if let existing = continuousRenderedPages[request.pageIndex],
+           existing.satisfies(request) {
+            publishContinuousImageIfNeeded(existing, for: request.pageIndex)
+            return
+        }
+
+        if continuousInFlightPages.contains(request.pageIndex) {
+            continuousPendingRequests[request.pageIndex] = request
+            return
+        }
+
+        continuousInFlightPages.insert(request.pageIndex)
+
+        continuousRenderQueue.async {
+            self.continuousRenderSemaphore.wait()
+            defer { self.continuousRenderSemaphore.signal() }
+
+            let shouldRender = self.shouldExecuteContinuousRender(request)
+            let renderedImage = shouldRender ? autoreleasepool {
+                self.renderContinuousImage(for: request)
+            } : nil
+
+            self.completeContinuousRender(
+                renderedImage,
+                request: request,
+                allowRetry: shouldRender
+            )
+        }
+    }
+
+    private func shouldExecuteContinuousRender(_ request: ContinuousRenderRequest) -> Bool {
+        continuousStateQueue.sync {
+            guard continuousVisiblePages.contains(request.pageIndex) else {
+                return false
             }
+
+            if let existing = continuousRenderedPages[request.pageIndex],
+               existing.satisfies(request) {
+                return false
+            }
+
+            if request.isPreview && request.generation < continuousRenderGeneration {
+                return false
+            }
+
+            if let pendingRequest = continuousPendingRequests[request.pageIndex],
+               pendingRequest != request,
+               pendingRequest.isHigherPriority(than: request) {
+                return false
+            }
+
+            return true
+        }
+    }
+
+    private func completeContinuousRender(_ image: NSImage?, request: ContinuousRenderRequest, allowRetry: Bool) {
+        continuousStateQueue.async {
+            self.continuousInFlightPages.remove(request.pageIndex)
+
+            let isRelevant = self.isContinuousRequestRelevantLocked(request)
+
+            if let image, isRelevant {
+                let newRecord = ContinuousRenderedPage(
+                    image: image,
+                    pixelSize: request.pixelSize,
+                    isPreview: request.isPreview
+                )
+
+                if let existing = self.continuousRenderedPages[request.pageIndex],
+                   !newRecord.isBetter(than: existing) {
+                    // Keep the better cached record but continue with a pending fresher request if needed.
+                } else {
+                    self.continuousRenderedPages[request.pageIndex] = newRecord
+                    self.publishContinuousImageIfNeeded(newRecord, for: request.pageIndex)
+                }
+            }
+
+            if allowRetry,
+               image == nil,
+               isRelevant,
+               request.attempt < 2,
+               self.continuousPendingRequests[request.pageIndex] == nil {
+                let retryRequest = ContinuousRenderRequest(
+                    generation: request.generation,
+                    pageIndex: request.pageIndex,
+                    pixelSize: request.pixelSize,
+                    isPreview: request.isPreview,
+                    attempt: request.attempt + 1
+                )
+                self.scheduleContinuousRenderLocked(retryRequest)
+            }
+
+            if let pendingRequest = self.continuousPendingRequests[request.pageIndex],
+               pendingRequest != request {
+                self.continuousPendingRequests.removeValue(forKey: request.pageIndex)
+                if self.isContinuousRequestRelevantLocked(pendingRequest) {
+                    self.scheduleContinuousRenderLocked(pendingRequest)
+                }
+            }
+
+            self.publishContinuousLoadingStateLocked()
+        }
+    }
+
+    private func publishContinuousImageIfNeeded(_ record: ContinuousRenderedPage, for pageIndex: Int) {
+        guard continuousVisiblePages.contains(pageIndex) else { return }
+
+        DispatchQueue.main.async {
+            guard self.viewMode == .continuous else { return }
+
+            var updatedImages = self.continuousImages
+            if let existingImage = updatedImages[pageIndex], existingImage === record.image {
+                return
+            }
+            updatedImages[pageIndex] = record.image
+            self.continuousImages = updatedImages
+            self.continuousLoadingProgress = 1.0
+        }
+    }
+
+    private func pruneContinuousRenderedPages(keeping allowedPages: Set<Int>) {
+        guard !continuousRenderedPages.isEmpty else { return }
+
+        let stalePages = continuousRenderedPages.keys.filter { !allowedPages.contains($0) }
+        for pageIndex in stalePages {
+            continuousRenderedPages.removeValue(forKey: pageIndex)
         }
     }
     
-    private func loadPageForContinuous(pageIndex: Int, completion: @escaping () -> Void) {
-        defer { completion() }
-        
-        // Проверяем кэш сначала
-        if let cachedImage = imageCache[pageIndex] {
-            DispatchQueue.main.async {
-                self.continuousImages[pageIndex] = cachedImage
-                print(" Страница \(pageIndex + 1) взята из кэша для непрерывного просмотра")
-            }
-            return
+    private func prunePublishedContinuousImages(keeping allowedPages: Set<Int>) {
+        let stalePages = continuousImages.keys.filter { !allowedPages.contains($0) }
+        guard !stalePages.isEmpty else { return }
+
+        var updatedImages = continuousImages
+        for pageIndex in stalePages {
+            updatedImages.removeValue(forKey: pageIndex)
         }
-        
-        // Проверяем, что мы уже не загружаем эту страницу
-        guard !continuousLoadingQueue.contains(pageIndex) else {
-            print(" Страница \(pageIndex + 1) уже загружается")
-            return
-        }
-        
-        continuousLoadingQueue.insert(pageIndex)
-        
-        defer {
-            continuousLoadingQueue.remove(pageIndex)
-        }
-        
-        print(" Загружаем страницу \(pageIndex + 1) для непрерывного просмотра")
-        
+        continuousImages = updatedImages
+    }
+
+    private func renderContinuousImage(for request: ContinuousRenderRequest) -> NSImage? {
         if let pdfDocument = self.pdfDocument {
-            loadPDFPageForContinuous(pageIndex: pageIndex, pdfDocument: pdfDocument)
+            return renderPDFPageForContinuous(pageIndex: request.pageIndex, pdfDocument: pdfDocument, pixelSize: request.pixelSize)
         } else if let documentURL = self.documentURL {
-            loadDJVUPageForContinuous(pageIndex: pageIndex, documentURL: documentURL)
+            return renderDJVUPageForContinuous(
+                pageIndex: request.pageIndex,
+                documentURL: documentURL,
+                pixelSize: request.pixelSize,
+                isPreview: request.isPreview
+            )
+        }
+
+        return nil
+    }
+
+    private func isContinuousRequestRelevantLocked(_ request: ContinuousRenderRequest) -> Bool {
+        continuousVisiblePages.contains(request.pageIndex)
+    }
+
+    private func publishContinuousLoadingStateLocked() {
+        let isLoading = !continuousInFlightPages.isEmpty || !continuousPendingRequests.isEmpty
+        DispatchQueue.main.async {
+            self.isContinuousLoading = isLoading
         }
     }
+
+    private func renderDJVUPageUsingRenderer(pageIndex: Int, pixelSize: CGSize, isPreview: Bool) -> NSImage? {
+        guard let slot = rendererSlot(for: pageIndex) else { return nil }
+
+        do {
+            return try slot.queue.sync {
+                try slot.renderer.renderPage(at: pageIndex, pixelSize: pixelSize, isPreview: isPreview)
+            }
+        } catch {
+            print(" libdjvu render error для страницы \(pageIndex + 1): \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func preferredDJVUDisplayPixelSize(for pageIndex: Int, maxLongEdge: CGFloat) -> CGSize {
+        if let pageSize = primaryDJVUPageSize(at: pageIndex),
+           pageSize.width > 0,
+           pageSize.height > 0 {
+            let scale = min(1.0, maxLongEdge / max(pageSize.width, pageSize.height))
+            return CGSize(
+                width: max(1, ceil(pageSize.width * scale)),
+                height: max(1, ceil(pageSize.height * scale))
+            )
+        }
+
+        let aspectRatio = continuousPageAspectRatios[pageIndex] ?? (4.0 / 3.0)
+        let width = min(maxLongEdge, 2200)
+        return CGSize(width: width, height: max(1, ceil(width * aspectRatio)))
+    }
     
-    private func loadPDFPageForContinuous(pageIndex: Int, pdfDocument: PDFDocument) {
+    private func renderPDFPageForContinuous(pageIndex: Int, pdfDocument: PDFDocument, pixelSize: CGSize) -> NSImage? {
         guard let page = pdfDocument.page(at: pageIndex) else {
             print(" Не удалось получить PDF страницу \(pageIndex + 1)")
-            return
+            return nil
         }
         
         let pageRect = page.bounds(for: .mediaBox)
-        let scale: CGFloat = 5.0 // Максимальное разрешение для непрерывного просмотра
-        let scaledSize = CGSize(width: pageRect.width * scale, height: pageRect.height * scale)
-        
-        let image = NSImage(size: scaledSize)
+        let image = NSImage(size: pixelSize)
         image.lockFocus()
         
         let context = NSGraphicsContext.current?.cgContext
         context?.saveGState()
-        context?.scaleBy(x: scale, y: scale)
+        context?.setFillColor(NSColor.white.cgColor)
+        context?.fill(CGRect(origin: .zero, size: pixelSize))
+        context?.interpolationQuality = .high
+        context?.scaleBy(
+            x: pixelSize.width / max(pageRect.width, 1),
+            y: pixelSize.height / max(pageRect.height, 1)
+        )
         
         page.draw(with: .mediaBox, to: context!)
         
         context?.restoreGState()
         image.unlockFocus()
-        
-        // Сохраняем в оба места одновременно
-        cacheQueue.async {
-            self.imageCache[pageIndex] = image
-            
-            DispatchQueue.main.async {
-                self.continuousImages[pageIndex] = image
-                print(" PDF страница \(pageIndex + 1) загружена для непрерывного просмотра")
-            }
-        }
+
+        print(" PDF страница \(pageIndex + 1) загружена для непрерывного просмотра")
+        return image
     }
-    
-    private func loadDJVUPageForContinuous(pageIndex: Int, documentURL: URL) {
+
+    private func renderDJVUPageUsingDDJVU(pageIndex: Int, documentURL: URL, pixelSize: CGSize) -> NSImage? {
         guard let ddjvuPath = findSystemExecutable(name: "ddjvu") else {
             print(" ddjvu не найден для загрузки страницы \(pageIndex + 1)")
-            return
+            return nil
         }
-        
+
         var workingURL = documentURL
         var needsCleanup = false
-        
+
         if hasNonASCIICharacters(in: documentURL) {
             if let tempURL = copyToTempWithASCIIName(originalURL: documentURL) {
                 workingURL = tempURL
                 needsCleanup = true
             }
         }
-        
+
         defer {
             if needsCleanup {
                 try? FileManager.default.removeItem(at: workingURL)
             }
         }
-        
+
         let tempDir = FileManager.default.temporaryDirectory
         let tempImageURL = tempDir.appendingPathComponent("djvu_continuous_\(pageIndex)_\(UUID().uuidString).ppm")
-        
-        let settings = ["-format=ppm", "-page=\(pageIndex + 1)", "-scale=400"]
-        
+        let settings = [
+            "-format=ppm",
+            "-page=\(pageIndex + 1)",
+            "-size=\(Int(pixelSize.width))x\(Int(pixelSize.height))"
+        ]
+
         let task = Process()
         task.executableURL = URL(fileURLWithPath: ddjvuPath)
         task.arguments = settings + [workingURL.path, tempImageURL.path]
-        
+
         do {
             try task.run()
             task.waitUntilExit()
-            
+
             if task.terminationStatus == 0 && FileManager.default.fileExists(atPath: tempImageURL.path) {
                 if let image = NSImage(contentsOf: tempImageURL) {
-                    
-                    cacheQueue.async {
-                        self.imageCache[pageIndex] = image
-                        
-                        DispatchQueue.main.async {
-                            self.continuousImages[pageIndex] = image
-                            print(" DJVU страница \(pageIndex + 1) загружена для непрерывного просмотра")
-                        }
-                    }
-                } else {
-                    print(" Не удалось создать NSImage из DJVU страницы \(pageIndex + 1)")
+                    try? FileManager.default.removeItem(at: tempImageURL)
+                    return image
                 }
+
+                print(" Не удалось создать NSImage из DJVU страницы \(pageIndex + 1)")
             } else {
                 print(" Ошибка конвертации DJVU страницы \(pageIndex + 1), код: \(task.terminationStatus)")
             }
-            
+
             try? FileManager.default.removeItem(at: tempImageURL)
         } catch {
             print(" Исключение при загрузке DJVU страницы \(pageIndex + 1): \(error)")
             try? FileManager.default.removeItem(at: tempImageURL)
         }
+
+        return nil
+    }
+    
+    private func renderDJVUPageForContinuous(pageIndex: Int, documentURL: URL, pixelSize: CGSize, isPreview: Bool) -> NSImage? {
+        if isPreview {
+            if let renderedImage = renderDJVUPageUsingRenderer(pageIndex: pageIndex, pixelSize: pixelSize, isPreview: true) {
+                return renderedImage
+            }
+
+            return renderDJVUPageUsingDDJVU(pageIndex: pageIndex, documentURL: documentURL, pixelSize: pixelSize)
+        }
+
+        if let renderedImage = renderDJVUPageUsingRenderer(pageIndex: pageIndex, pixelSize: pixelSize, isPreview: false) {
+            return renderedImage
+        }
+
+        return renderDJVUPageUsingDDJVU(pageIndex: pageIndex, documentURL: documentURL, pixelSize: pixelSize)
     }
     
     // MARK: - PDF Support
     private func loadPDFDocument(from url: URL) {
+        djvuRenderer = nil
+
         guard let pdf = PDFDocument(url: url) else {
             errorMessage = "Не удалось загрузить PDF документ"
             return
         }
-        
+
         pdfDocument = pdf
         totalPages = pdf.pageCount
+        preparePDFContinuousLayoutMetrics(pdf)
         isLoaded = true
         print(" PDF документ загружен, страниц: \(totalPages)")
-        
+
         loadFirstPageOnly(0)
     }
     
-    // MARK: - DJVU Support (без библиотеки)
+    // MARK: - DJVU Support
     private func loadDJVUDocument(from url: URL) {
         print("Загружаем DJVU файл: \(url.lastPathComponent)")
+
+        do {
+            let rendererPool = try createPersistentDJVURenderers(for: url, preferredCount: 3)
+            guard let renderer = rendererPool.first else {
+                throw NSError(domain: "DJVUDocument", code: 1, userInfo: [NSLocalizedDescriptionKey: "Не удалось создать renderer pool"])
+            }
+            djvuRenderer = renderer
+            djvuRendererSlots = rendererPool.enumerated().map { index, renderer in
+                DJVURendererSlot(
+                    renderer: renderer,
+                    queue: DispatchQueue(label: "djvu.renderer.queue.\(index)", qos: .userInitiated)
+                )
+            }
+
+            DispatchQueue.main.async {
+                self.totalPages = renderer.pageCount
+                self.setContinuousPageAspectRatios(self.swiftAspectRatios(from: renderer.pageAspectRatios))
+                self.isLoaded = true
+                print(" DJVU документ загружен через libdjvu, страниц: \(renderer.pageCount)")
+                self.loadFirstPageOnly(0)
+            }
+            return
+        } catch {
+            print(" libdjvu renderer не инициализирован, используем fallback: \(error.localizedDescription)")
+        }
         
         guard let djvusedPath = findSystemExecutable(name: "djvused") else {
             errorMessage = "DJVU утилиты не установлены. Установите djvulibre через Homebrew: brew install djvulibre"
@@ -382,6 +722,49 @@ class DJVUDocument: ObservableObject {
         }
         
         getDJVUPageCount(url: url, djvusedPath: djvusedPath)
+    }
+
+    private func createPersistentDJVURenderers(for url: URL, preferredCount: Int) throws -> [DJVULibreRenderer] {
+        try djvuRendererQueue.sync {
+            let rendererCount = max(1, preferredCount)
+            return try (0..<rendererCount).map { _ in
+                try DJVULibreRenderer(url: url)
+            }
+        }
+    }
+
+    private func rendererSlot(for pageIndex: Int) -> DJVURendererSlot? {
+        guard !djvuRendererSlots.isEmpty else {
+            guard let djvuRenderer else { return nil }
+            return DJVURendererSlot(renderer: djvuRenderer, queue: djvuRendererQueue)
+        }
+
+        let slotIndex = pageIndex % djvuRendererSlots.count
+        return djvuRendererSlots[slotIndex]
+    }
+
+    private func primaryDJVUPageSize(at pageIndex: Int) -> CGSize? {
+        if let primarySlot = djvuRendererSlots.first {
+            return primarySlot.queue.sync {
+                primarySlot.renderer.pageSize(at: pageIndex)
+            }
+        }
+
+        if let djvuRenderer {
+            return djvuRendererQueue.sync {
+                djvuRenderer.pageSize(at: pageIndex)
+            }
+        }
+
+        return nil
+    }
+
+    private func swiftAspectRatios(from source: [NSNumber: NSNumber]) -> [Int: CGFloat] {
+        var result: [Int: CGFloat] = [:]
+        for (key, value) in source {
+            result[key.intValue] = CGFloat(value.doubleValue)
+        }
+        return result
     }
     
     private func findSystemExecutable(name: String) -> String? {
@@ -477,8 +860,15 @@ class DJVUDocument: ObservableObject {
                     let trimmedOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
                     
                     if let pages = Int(trimmedOutput) {
+                        let aspectRatios = self.fetchDJVUPageAspectRatios(
+                            url: workingURL,
+                            totalPages: pages,
+                            djvusedPath: djvusedPath
+                        )
                         DispatchQueue.main.async {
                             self.totalPages = pages
+                            self.continuousPageAspectRatios = aspectRatios
+                            self.continuousLayoutVersion &+= 1
                             self.isLoaded = true
                             print(" DJVU документ загружен, страниц: \(pages)")
                             self.loadFirstPageOnly(0)
@@ -488,8 +878,15 @@ class DJVUDocument: ObservableObject {
                     
                     let numbers = trimmedOutput.components(separatedBy: CharacterSet.decimalDigits.inverted).compactMap { Int($0) }
                     if let firstNumber = numbers.first, firstNumber > 0 {
+                        let aspectRatios = self.fetchDJVUPageAspectRatios(
+                            url: workingURL,
+                            totalPages: firstNumber,
+                            djvusedPath: djvusedPath
+                        )
                         DispatchQueue.main.async {
                             self.totalPages = firstNumber
+                            self.continuousPageAspectRatios = aspectRatios
+                            self.continuousLayoutVersion &+= 1
                             self.isLoaded = true
                             print(" DJVU документ загружен, страниц: \(firstNumber)")
                             self.loadFirstPageOnly(0)
@@ -566,9 +963,22 @@ class DJVUDocument: ObservableObject {
                 }
                 
                 try? FileManager.default.removeItem(at: tempImageURL)
+
+                let aspectRatios: [Int: CGFloat]
+                if let djvusedPath = self.findSystemExecutable(name: "djvused") {
+                    aspectRatios = self.fetchDJVUPageAspectRatios(
+                        url: workingURL,
+                        totalPages: foundPages,
+                        djvusedPath: djvusedPath
+                    )
+                } else {
+                    aspectRatios = [:]
+                }
                 
                 DispatchQueue.main.async {
                     self.totalPages = foundPages
+                    self.continuousPageAspectRatios = aspectRatios
+                    self.continuousLayoutVersion &+= 1
                     self.isLoaded = true
                     print(" DJVU определено страниц: \(foundPages)")
                     self.loadFirstPageOnly(0)
@@ -620,6 +1030,91 @@ class DJVUDocument: ObservableObject {
         }
         
         return false
+    }
+
+    private func preparePDFContinuousLayoutMetrics(_ pdfDocument: PDFDocument) {
+        var aspectRatios: [Int: CGFloat] = [:]
+
+        for pageIndex in 0..<pdfDocument.pageCount {
+            guard let page = pdfDocument.page(at: pageIndex) else { continue }
+            let bounds = page.bounds(for: .mediaBox)
+            guard bounds.width > 0, bounds.height > 0 else { continue }
+            aspectRatios[pageIndex] = bounds.height / bounds.width
+        }
+
+        setContinuousPageAspectRatios(aspectRatios)
+    }
+
+    private func fetchDJVUPageAspectRatios(url: URL, totalPages: Int, djvusedPath: String) -> [Int: CGFloat] {
+        guard totalPages > 0 else { return [:] }
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: djvusedPath)
+        task.arguments = [url.path]
+
+        let inputPipe = Pipe()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        task.standardInput = inputPipe
+        task.standardOutput = outputPipe
+        task.standardError = errorPipe
+
+        let commands = (1...totalPages)
+            .map { "select \($0)\nsize" }
+            .joined(separator: "\n") + "\n"
+
+        do {
+            try task.run()
+
+            if let commandData = commands.data(using: .utf8) {
+                inputPipe.fileHandleForWriting.write(commandData)
+            }
+            inputPipe.fileHandleForWriting.closeFile()
+            task.waitUntilExit()
+
+            guard task.terminationStatus == 0 else {
+                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                if let errorOutput = String(data: errorData, encoding: .utf8), !errorOutput.isEmpty {
+                    print(" Не удалось получить размеры страниц DJVU: \(errorOutput)")
+                }
+                return [:]
+            }
+
+            let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            guard let output = String(data: data, encoding: .utf8) else {
+                return [:]
+            }
+
+            let lines = output
+                .components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+
+            var aspectRatios: [Int: CGFloat] = [:]
+            var pageIndex = 0
+
+            for line in lines {
+                guard pageIndex < totalPages else { break }
+
+                let numbers = line
+                    .components(separatedBy: CharacterSet.decimalDigits.inverted)
+                    .compactMap(Int.init)
+
+                guard numbers.count >= 2 else { continue }
+
+                let width = CGFloat(numbers[0])
+                let height = CGFloat(numbers[1])
+                guard width > 0, height > 0 else { continue }
+
+                aspectRatios[pageIndex] = height / width
+                pageIndex += 1
+            }
+
+            return aspectRatios
+        } catch {
+            print(" Ошибка получения размеров страниц DJVU: \(error)")
+            return [:]
+        }
     }
     
     // MARK: - Page Loading (обновлено с увеличенным разрешением)
@@ -759,6 +1254,37 @@ class DJVUDocument: ObservableObject {
     }
     
     private func loadDJVUPageForDisplay(pageIndex: Int, documentURL: URL, isFirstPage: Bool) {
+        if let renderedImage = renderDJVUPageUsingRenderer(
+            pageIndex: pageIndex,
+            pixelSize: preferredDJVUDisplayPixelSize(for: pageIndex, maxLongEdge: 3200),
+            isPreview: false
+        ) {
+            cacheQueue.async {
+                self.imageCache[pageIndex] = renderedImage
+                self.limitCacheSize()
+            }
+
+            DispatchQueue.main.async {
+                if self.currentPage == pageIndex {
+                    self.currentImage = renderedImage
+                    self.isLoading = false
+                    self.errorMessage = ""
+
+                    if isFirstPage {
+                        self.setViewMode(.continuous)
+                    }
+                }
+                self.isLoadingPage = false
+            }
+
+            if !isFirstPage {
+                schedulePreloadAdjacentPages(around: pageIndex)
+            } else {
+                startBackgroundPreloading(from: pageIndex)
+            }
+            return
+        }
+
         guard let ddjvuPath = findSystemExecutable(name: "ddjvu") else {
             DispatchQueue.main.async {
                 self.isLoading = false
@@ -786,7 +1312,6 @@ class DJVUDocument: ObservableObject {
         }
         
         let tempDir = FileManager.default.temporaryDirectory
-        let tempImageURL = tempDir.appendingPathComponent("djvu_page_\(pageIndex)_\(UUID().uuidString).ppm")
         
         let conversionSettings = [
             ["-format=ppm", "-page=\(pageIndex + 1)", "-scale=400"],
@@ -877,6 +1402,14 @@ class DJVUDocument: ObservableObject {
     
     // MARK: - Фоновая предзагрузка
     private func startBackgroundPreloading(from startPage: Int) {
+        guard viewMode == .single else {
+            DispatchQueue.main.async {
+                self.isBackgroundLoading = false
+                self.backgroundLoadingProgress = 0
+            }
+            return
+        }
+
         print(" Запускаем фоновую предзагрузку всего документа, начиная с окрестности страницы \(startPage + 1)")
         
         let totalPagesToPreload = totalPages - 1
@@ -937,16 +1470,25 @@ class DJVUDocument: ObservableObject {
     private func updateBackgroundProgress(totalToLoad: Int) {
         DispatchQueue.main.async {
             self.completedPreloads += 1
-            self.backgroundLoadingProgress = Double(self.completedPreloads) / Double(totalToLoad)
+            let progress = Double(self.completedPreloads) / Double(totalToLoad)
+
+            if progress >= 1.0 || progress - self.lastPublishedBackgroundProgress >= 0.05 {
+                self.backgroundLoadingProgress = progress
+                self.lastPublishedBackgroundProgress = progress
+            }
             
             if self.completedPreloads >= totalToLoad {
                 self.isBackgroundLoading = false
+                self.backgroundLoadingProgress = 1.0
+                self.lastPublishedBackgroundProgress = 1.0
                 print(" Фоновая предзагрузка завершена: \(self.completedPreloads)/\(totalToLoad)")
             }
         }
     }
     
     private func schedulePreloadAdjacentPages(around centerPage: Int) {
+        guard viewMode == .single else { return }
+
         let pagesToPreload = [centerPage - 1, centerPage + 1]
         
         preloadQueue_dispatch.async {
@@ -1012,6 +1554,19 @@ class DJVUDocument: ObservableObject {
     }
     
     private func preloadDJVUPageSilently(pageIndex: Int, documentURL: URL) {
+        if let renderedImage = renderDJVUPageUsingRenderer(
+            pageIndex: pageIndex,
+            pixelSize: preferredDJVUDisplayPixelSize(for: pageIndex, maxLongEdge: 2200),
+            isPreview: true
+        ) {
+            cacheQueue.async {
+                self.imageCache[pageIndex] = renderedImage
+                self.limitCacheSize()
+                print(" DJVU страница \(pageIndex + 1) предзагружена через libdjvu")
+            }
+            return
+        }
+
         guard let ddjvuPath = findSystemExecutable(name: "ddjvu") else { return }
         
         var workingURL = documentURL
