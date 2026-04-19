@@ -1,11 +1,32 @@
+import AppKit
 import SwiftUI
 
+private enum WindowLayoutMode {
+    case welcome
+    case document
+}
+
 struct ContentView: View {
+    let initialDocumentURL: URL?
+    let participatesInPrimaryOpenQueue: Bool
+
     @StateObject private var djvuDocument = DJVUDocument()
+    @ObservedObject private var documentOpenCoordinator = DocumentOpenCoordinator.shared
     @State private var showingFileImporter = false
     @State private var zoomLevel: Double = 1.0
     @State private var pageOffset: CGFloat = 0
     @State private var isTransitioning = false
+    @State private var window: NSWindow?
+    @State private var appliedWindowLayout: WindowLayoutMode?
+    @State private var didLoadInitialDocument = false
+    @State private var isRegisteredAsPrimaryDocumentTarget = false
+    @State private var commandObserverTokens: [NSObjectProtocol] = []
+    @State private var keyWindowObserverToken: NSObjectProtocol?
+
+    init(initialDocumentURL: URL? = nil, participatesInPrimaryOpenQueue: Bool = true) {
+        self.initialDocumentURL = initialDocumentURL
+        self.participatesInPrimaryOpenQueue = participatesInPrimaryOpenQueue
+    }
     
     var body: some View {
         VStack(spacing: 0) {
@@ -33,10 +54,14 @@ struct ContentView: View {
                 // Экран приветствия
                 WelcomeView(
                     djvuDocument: djvuDocument,
-                    showingFileImporter: $showingFileImporter
+                    showingFileImporter: $showingFileImporter,
+                    onOpenDocuments: openDocuments
                 )
             }
         }
+        .background(WindowAccessor { window in
+            handleResolvedWindow(window)
+        })
         .fileImporter(
             isPresented: $showingFileImporter,
             allowedContentTypes: [
@@ -44,13 +69,11 @@ struct ContentView: View {
                 .init(filenameExtension: "djv")!,
                 .pdf
             ],
-            allowsMultipleSelection: false
+            allowsMultipleSelection: true
         ) { result in
             switch result {
             case .success(let files):
-                if let url = files.first {
-                    djvuDocument.loadDocument(from: url)
-                }
+                openDocuments(files)
             case .failure(let error):
                 print("Ошибка выбора файла: \(error)")
             }
@@ -136,120 +159,273 @@ struct ContentView: View {
         .onAppear {
             zoomLevel = 1.0
             setupMenuObservers()
+            updatePrimaryDocumentTargetRegistration()
+
+            let initialLayout: WindowLayoutMode = (
+                djvuDocument.isLoaded
+                || initialDocumentURL != nil
+                || documentOpenCoordinator.pendingPrimaryDocumentURL != nil
+            )
+                ? .document
+                : .welcome
+            applyWindowLayoutIfNeeded(initialLayout, center: true)
+            loadInitialDocumentIfNeeded()
+            loadPendingPrimaryDocumentIfNeeded(documentOpenCoordinator.pendingPrimaryDocumentURL)
         }
         .onDisappear {
             removeMenuObservers()
+            updatePrimaryDocumentTargetRegistration(forceUnregister: true)
+        }
+        .onReceive(documentOpenCoordinator.$pendingPrimaryDocumentURL) { url in
+            if url != nil, participatesInPrimaryOpenQueue, initialDocumentURL == nil {
+                applyWindowLayoutIfNeeded(.document, center: true)
+            }
+            loadPendingPrimaryDocumentIfNeeded(url)
+        }
+        .onChange(of: djvuDocument.isLoaded) { _, isLoaded in
+            updatePrimaryDocumentTargetRegistration()
+            applyWindowLayoutIfNeeded(isLoaded ? .document : .welcome, center: true)
         }
     }
     
     // MARK: - Обработка команд меню
     private func setupMenuObservers() {
-        NotificationCenter.default.addObserver(
-            forName: .switchToSingleMode,
-            object: nil,
-            queue: .main
-        ) { _ in
-            withAnimation(.easeInOut(duration: 0.3)) {
-                djvuDocument.setViewMode(.single)
-            }
-        }
-        
-        NotificationCenter.default.addObserver(
-            forName: .switchToContinuousMode,
-            object: nil,
-            queue: .main
-        ) { _ in
-            withAnimation(.easeInOut(duration: 0.3)) {
-                djvuDocument.setViewMode(.continuous)
-            }
-        }
-        
-        NotificationCenter.default.addObserver(
-            forName: .openDocument,
-            object: nil,
-            queue: .main
-        ) { _ in
-            showingFileImporter = true
-        }
-        
-        NotificationCenter.default.addObserver(
-            forName: .previousPage,
-            object: nil,
-            queue: .main
-        ) { _ in
-            if djvuDocument.isLoaded && !djvuDocument.isLoading {
+        guard commandObserverTokens.isEmpty else { return }
+        let notificationCenter = NotificationCenter.default
+
+        commandObserverTokens = [
+            notificationCenter.addObserver(forName: .switchToSingleMode, object: nil, queue: .main) { note in
+                guard shouldHandleWindowCommand(note) else { return }
                 withAnimation(.easeInOut(duration: 0.3)) {
-                    djvuDocument.previousPage()
+                    djvuDocument.setViewMode(.single)
                 }
-            }
-        }
-        
-        NotificationCenter.default.addObserver(
-            forName: .nextPage,
-            object: nil,
-            queue: .main
-        ) { _ in
-            if djvuDocument.isLoaded && !djvuDocument.isLoading {
+            },
+            notificationCenter.addObserver(forName: .switchToContinuousMode, object: nil, queue: .main) { note in
+                guard shouldHandleWindowCommand(note) else { return }
                 withAnimation(.easeInOut(duration: 0.3)) {
-                    djvuDocument.nextPage()
+                    djvuDocument.setViewMode(.continuous)
                 }
-            }
-        }
-        
-        NotificationCenter.default.addObserver(
-            forName: .firstPage,
-            object: nil,
-            queue: .main
-        ) { _ in
-            if djvuDocument.isLoaded && !djvuDocument.isLoading {
-                withAnimation(.easeInOut(duration: 0.4)) {
-                    djvuDocument.goToPage(0)
+            },
+            notificationCenter.addObserver(forName: .openDocument, object: nil, queue: .main) { note in
+                guard shouldHandleWindowCommand(note) else { return }
+                showingFileImporter = true
+            },
+            notificationCenter.addObserver(forName: .previousPage, object: nil, queue: .main) { note in
+                guard shouldHandleWindowCommand(note) else { return }
+                if djvuDocument.isLoaded && !djvuDocument.isLoading {
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        djvuDocument.previousPage()
+                    }
                 }
-            }
-        }
-        
-        NotificationCenter.default.addObserver(
-            forName: .lastPage,
-            object: nil,
-            queue: .main
-        ) { _ in
-            if djvuDocument.isLoaded && !djvuDocument.isLoading {
-                withAnimation(.easeInOut(duration: 0.4)) {
-                    djvuDocument.goToPage(djvuDocument.totalPages - 1)
+            },
+            notificationCenter.addObserver(forName: .nextPage, object: nil, queue: .main) { note in
+                guard shouldHandleWindowCommand(note) else { return }
+                if djvuDocument.isLoaded && !djvuDocument.isLoading {
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        djvuDocument.nextPage()
+                    }
                 }
+            },
+            notificationCenter.addObserver(forName: .firstPage, object: nil, queue: .main) { note in
+                guard shouldHandleWindowCommand(note) else { return }
+                if djvuDocument.isLoaded && !djvuDocument.isLoading {
+                    withAnimation(.easeInOut(duration: 0.4)) {
+                        djvuDocument.goToPage(0)
+                    }
+                }
+            },
+            notificationCenter.addObserver(forName: .lastPage, object: nil, queue: .main) { note in
+                guard shouldHandleWindowCommand(note) else { return }
+                if djvuDocument.isLoaded && !djvuDocument.isLoading {
+                    withAnimation(.easeInOut(duration: 0.4)) {
+                        djvuDocument.goToPage(djvuDocument.totalPages - 1)
+                    }
+                }
+            },
+            notificationCenter.addObserver(forName: .zoomIn, object: nil, queue: .main) { note in
+                guard shouldHandleWindowCommand(note) else { return }
+                NotificationCenter.default.post(name: .keyboardZoomChange, object: nil, userInfo: ["delta": 0.25])
+            },
+            notificationCenter.addObserver(forName: .zoomOut, object: nil, queue: .main) { note in
+                guard shouldHandleWindowCommand(note) else { return }
+                NotificationCenter.default.post(name: .keyboardZoomChange, object: nil, userInfo: ["delta": -0.25])
+            },
+            notificationCenter.addObserver(forName: .zoomReset, object: nil, queue: .main) { note in
+                guard shouldHandleWindowCommand(note) else { return }
+                NotificationCenter.default.post(name: .keyboardZoomReset, object: nil)
             }
-        }
-        
-        NotificationCenter.default.addObserver(
-            forName: .zoomIn,
-            object: nil,
-            queue: .main
-        ) { _ in
-            // Отправляем уведомление о том, что зум изменяется через клавиатуру
-            NotificationCenter.default.post(name: .keyboardZoomChange, object: nil, userInfo: ["delta": 0.25])
-        }
-        
-        NotificationCenter.default.addObserver(
-            forName: .zoomOut,
-            object: nil,
-            queue: .main
-        ) { _ in
-            // Отправляем уведомление о том, что зум изменяется через клавиатуру
-            NotificationCenter.default.post(name: .keyboardZoomChange, object: nil, userInfo: ["delta": -0.25])
-        }
-        
-        NotificationCenter.default.addObserver(
-            forName: .zoomReset,
-            object: nil,
-            queue: .main
-        ) { _ in
-            // Отправляем уведомление о том, что зум сбрасывается через клавиатуру
-            NotificationCenter.default.post(name: .keyboardZoomReset, object: nil)
-        }
+        ]
     }
     
     private func removeMenuObservers() {
-        NotificationCenter.default.removeObserver(self)
+        let notificationCenter = NotificationCenter.default
+        commandObserverTokens.forEach { notificationCenter.removeObserver($0) }
+        commandObserverTokens.removeAll()
+
+        if let keyWindowObserverToken {
+            notificationCenter.removeObserver(keyWindowObserverToken)
+            self.keyWindowObserverToken = nil
+        }
+    }
+
+    private func loadInitialDocumentIfNeeded() {
+        guard !didLoadInitialDocument, let initialDocumentURL else { return }
+        didLoadInitialDocument = true
+        applyWindowLayoutIfNeeded(.document, center: true)
+        djvuDocument.loadDocument(from: initialDocumentURL)
+    }
+
+    private func loadPendingPrimaryDocumentIfNeeded(_ url: URL?) {
+        guard participatesInPrimaryOpenQueue,
+              initialDocumentURL == nil,
+              !djvuDocument.isLoaded,
+              let url,
+              url.isSupportedDocumentURL else { return }
+
+        applyWindowLayoutIfNeeded(.document, center: true)
+        djvuDocument.loadDocument(from: url)
+        documentOpenCoordinator.consumePendingPrimaryDocument()
+        updatePrimaryDocumentTargetRegistration()
+    }
+
+    private func openDocuments(_ urls: [URL]) {
+        let supportedURLs = urls.filter(\.isSupportedDocumentURL)
+        guard !supportedURLs.isEmpty else { return }
+
+        if supportedURLs.count > 1 {
+            documentOpenCoordinator.openInNewWindows(supportedURLs)
+            return
+        }
+
+        let canReuseCurrentWindow = initialDocumentURL == nil && !djvuDocument.isLoaded
+
+        if canReuseCurrentWindow, let firstURL = supportedURLs.first {
+            applyWindowLayoutIfNeeded(.document, center: true)
+            djvuDocument.loadDocument(from: firstURL)
+            documentOpenCoordinator.consumePendingPrimaryDocument()
+            updatePrimaryDocumentTargetRegistration()
+            documentOpenCoordinator.openInNewWindows(Array(supportedURLs.dropFirst()))
+            return
+        }
+
+        documentOpenCoordinator.openInNewWindows(supportedURLs)
+    }
+
+    private func updatePrimaryDocumentTargetRegistration(forceUnregister: Bool = false) {
+        let shouldRegister = !forceUnregister
+            && participatesInPrimaryOpenQueue
+            && initialDocumentURL == nil
+            && !djvuDocument.isLoaded
+
+        if shouldRegister && !isRegisteredAsPrimaryDocumentTarget {
+            documentOpenCoordinator.registerPrimaryDocumentTarget()
+            isRegisteredAsPrimaryDocumentTarget = true
+        } else if !shouldRegister && isRegisteredAsPrimaryDocumentTarget {
+            documentOpenCoordinator.unregisterPrimaryDocumentTarget()
+            isRegisteredAsPrimaryDocumentTarget = false
+        }
+    }
+
+    private func handleResolvedWindow(_ window: NSWindow) {
+        if self.window !== window {
+            self.window = window
+            installKeyWindowObserver(for: window)
+        }
+
+        let preferredLayout: WindowLayoutMode = (
+            djvuDocument.isLoaded
+            || initialDocumentURL != nil
+            || documentOpenCoordinator.pendingPrimaryDocumentURL != nil
+        )
+            ? .document
+            : .welcome
+        applyWindowLayoutIfNeeded(preferredLayout, center: true)
+    }
+
+    private func applyWindowLayoutIfNeeded(_ layout: WindowLayoutMode, center: Bool) {
+        guard let window else { return }
+        guard appliedWindowLayout != layout else { return }
+
+        let visibleFrame = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+        let targetSize: NSSize
+        switch layout {
+        case .welcome:
+            targetSize = AppWindowLayout.welcomeFrameSize(for: visibleFrame)
+        case .document:
+            targetSize = AppWindowLayout.documentFrameSize(for: visibleFrame)
+        }
+
+        let currentFrame = window.frame
+        let targetOrigin: NSPoint
+
+        if center, let screenFrame = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame {
+            targetOrigin = NSPoint(
+                x: screenFrame.midX - targetSize.width / 2,
+                y: screenFrame.midY - targetSize.height / 2
+            )
+        } else {
+            targetOrigin = NSPoint(
+                x: currentFrame.midX - targetSize.width / 2,
+                y: currentFrame.midY - targetSize.height / 2
+            )
+        }
+
+        let targetFrame = NSRect(origin: targetOrigin, size: targetSize)
+        if abs(currentFrame.width - targetSize.width) > 0.5
+            || abs(currentFrame.height - targetSize.height) > 0.5
+            || abs(currentFrame.origin.x - targetOrigin.x) > 0.5
+            || abs(currentFrame.origin.y - targetOrigin.y) > 0.5 {
+            window.setFrame(targetFrame, display: true, animate: true)
+        }
+
+        appliedWindowLayout = layout
+    }
+
+    private func installKeyWindowObserver(for window: NSWindow) {
+        if let keyWindowObserverToken {
+            NotificationCenter.default.removeObserver(keyWindowObserverToken)
+            self.keyWindowObserverToken = nil
+        }
+
+        if window.isKeyWindow {
+            WindowCommandRouter.shared.activeWindowNumber = window.windowNumber
+        }
+
+        keyWindowObserverToken = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: window,
+            queue: .main
+        ) { _ in
+            WindowCommandRouter.shared.activeWindowNumber = window.windowNumber
+        }
+    }
+
+    private func shouldHandleWindowCommand(_ note: Notification) -> Bool {
+        guard let window else { return false }
+        guard let targetWindowNumber = note.object as? Int else { return false }
+        return targetWindowNumber == window.windowNumber
+    }
+}
+
+private struct WindowAccessor: NSViewRepresentable {
+    let onResolve: (NSWindow) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            if let window = view.window {
+                onResolve(window)
+            }
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            if let window = nsView.window {
+                onResolve(window)
+            }
+        }
     }
 }
 
@@ -1127,6 +1303,7 @@ struct DocumentView: View {
 struct WelcomeView: View {
     @ObservedObject var djvuDocument: DJVUDocument
     @Binding var showingFileImporter: Bool
+    let onOpenDocuments: ([URL]) -> Void
     
     var body: some View {
         VStack(spacing: 40) {
@@ -1141,7 +1318,7 @@ struct WelcomeView: View {
                         .font(.system(.largeTitle, design: .rounded))
                         .fontWeight(.light)
                     
-                    Text("Современный просмотрщик DJVU и PDF документов")
+                    Text("Современный просмотрщик DJVU документов")
                         .font(.title3)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
@@ -1182,7 +1359,6 @@ struct WelcomeView: View {
                         
                         HStack(spacing: 16) {
                             Label("DJVU", systemImage: "doc.text")
-                            Label("PDF", systemImage: "doc.text.fill")
                         }
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -1207,19 +1383,34 @@ struct WelcomeView: View {
     }
     
     private func handleDroppedFiles(providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first else { return false }
-        
-        provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { item, error in
-            if let data = item as? Data,
-               let url = URL(dataRepresentation: data, relativeTo: nil) {
-                let fileExtension = url.pathExtension.lowercased()
-                if ["djvu", "djv", "pdf"].contains(fileExtension) {
-                    DispatchQueue.main.async {
-                        djvuDocument.loadDocument(from: url)
-                    }
+        let fileProviders = providers.filter { $0.hasItemConformingToTypeIdentifier("public.file-url") }
+        guard !fileProviders.isEmpty else { return false }
+
+        let dispatchGroup = DispatchGroup()
+        let lock = NSLock()
+        var droppedURLs: [URL] = []
+
+        for provider in fileProviders {
+            dispatchGroup.enter()
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { item, _ in
+                defer { dispatchGroup.leave() }
+
+                if let data = item as? Data,
+                   let url = URL(dataRepresentation: data, relativeTo: nil),
+                   url.isSupportedDocumentURL {
+                    lock.lock()
+                    droppedURLs.append(url)
+                    lock.unlock()
                 }
             }
         }
+
+        dispatchGroup.notify(queue: .main) {
+            if !droppedURLs.isEmpty {
+                onOpenDocuments(droppedURLs)
+            }
+        }
+
         return true
     }
 }
