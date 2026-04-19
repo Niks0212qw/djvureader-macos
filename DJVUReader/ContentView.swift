@@ -12,6 +12,7 @@ struct ContentView: View {
 
     @StateObject private var djvuDocument = DJVUDocument()
     @ObservedObject private var documentOpenCoordinator = DocumentOpenCoordinator.shared
+    @ObservedObject private var documentStateManager = DocumentStateManager.shared
     @State private var showingFileImporter = false
     @State private var zoomLevel: Double = 1.0
     @State private var pageOffset: CGFloat = 0
@@ -54,6 +55,7 @@ struct ContentView: View {
                 // Экран приветствия
                 WelcomeView(
                     djvuDocument: djvuDocument,
+                    documentStateManager: documentStateManager,
                     showingFileImporter: $showingFileImporter,
                     onOpenDocuments: openDocuments
                 )
@@ -158,6 +160,7 @@ struct ContentView: View {
         }
         .onAppear {
             zoomLevel = 1.0
+            documentStateManager.cleanupMissingDocuments()
             setupMenuObservers()
             updatePrimaryDocumentTargetRegistration()
 
@@ -272,7 +275,7 @@ struct ContentView: View {
         guard !didLoadInitialDocument, let initialDocumentURL else { return }
         didLoadInitialDocument = true
         applyWindowLayoutIfNeeded(.document, center: true)
-        djvuDocument.loadDocument(from: initialDocumentURL)
+        loadDocumentInCurrentWindow(from: initialDocumentURL)
     }
 
     private func loadPendingPrimaryDocumentIfNeeded(_ url: URL?) {
@@ -283,7 +286,7 @@ struct ContentView: View {
               url.isSupportedDocumentURL else { return }
 
         applyWindowLayoutIfNeeded(.document, center: true)
-        djvuDocument.loadDocument(from: url)
+        loadDocumentInCurrentWindow(from: url)
         documentOpenCoordinator.consumePendingPrimaryDocument()
         updatePrimaryDocumentTargetRegistration()
     }
@@ -301,7 +304,7 @@ struct ContentView: View {
 
         if canReuseCurrentWindow, let firstURL = supportedURLs.first {
             applyWindowLayoutIfNeeded(.document, center: true)
-            djvuDocument.loadDocument(from: firstURL)
+            loadDocumentInCurrentWindow(from: firstURL)
             documentOpenCoordinator.consumePendingPrimaryDocument()
             updatePrimaryDocumentTargetRegistration()
             documentOpenCoordinator.openInNewWindows(Array(supportedURLs.dropFirst()))
@@ -324,6 +327,11 @@ struct ContentView: View {
             documentOpenCoordinator.unregisterPrimaryDocumentTarget()
             isRegisteredAsPrimaryDocumentTarget = false
         }
+    }
+
+    private func loadDocumentInCurrentWindow(from url: URL) {
+        documentStateManager.addRecentDocument(url)
+        djvuDocument.loadDocument(from: url)
     }
 
     private func handleResolvedWindow(_ window: NSWindow) {
@@ -1302,11 +1310,18 @@ struct DocumentView: View {
 // MARK: - Экран приветствия
 struct WelcomeView: View {
     @ObservedObject var djvuDocument: DJVUDocument
+    @ObservedObject var documentStateManager: DocumentStateManager
     @Binding var showingFileImporter: Bool
     let onOpenDocuments: ([URL]) -> Void
+
+    private var visibleRecentDocuments: [URL] {
+        documentStateManager.recentDocuments.filter {
+            FileManager.default.fileExists(atPath: $0.path)
+        }
+    }
     
     var body: some View {
-        VStack(spacing: 40) {
+        VStack(spacing: 32) {
             VStack(spacing: 20) {
                 Image(systemName: "doc.text.image")
                     .font(.system(size: 100, weight: .ultraLight))
@@ -1365,6 +1380,10 @@ struct WelcomeView: View {
                     }
                 }
             }
+
+            if !visibleRecentDocuments.isEmpty {
+                recentDocumentsSection
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
@@ -1377,9 +1396,72 @@ struct WelcomeView: View {
                 endPoint: .bottomTrailing
             )
         )
+        .onAppear {
+            documentStateManager.cleanupMissingDocuments()
+        }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             handleDroppedFiles(providers: providers)
         }
+    }
+
+    private var recentDocumentsSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Недавние файлы")
+                    .font(.headline)
+                    .fontWeight(.medium)
+
+                Spacer()
+
+                Button("Очистить") {
+                    documentStateManager.clearRecentDocuments()
+                }
+                .buttonStyle(.link)
+            }
+
+            LazyVStack(spacing: 10) {
+                ForEach(Array(visibleRecentDocuments.prefix(6)), id: \.self) { url in
+                    Button {
+                        if FileManager.default.fileExists(atPath: url.path) {
+                            onOpenDocuments([url])
+                        } else {
+                            documentStateManager.removeRecentDocument(url)
+                        }
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: symbolName(for: url))
+                                .font(.title3)
+                                .foregroundColor(.accentColor)
+                                .frame(width: 28)
+
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(url.lastPathComponent)
+                                    .font(.body)
+                                    .foregroundColor(.primary)
+                                    .lineLimit(1)
+
+                                Text(url.deletingLastPathComponent().path)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+
+                            Spacer()
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
+                        .background(Color(NSColor.controlBackgroundColor).opacity(0.7))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .frame(maxWidth: 560)
+        .padding(20)
+        .background(Color(NSColor.windowBackgroundColor).opacity(0.45))
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
     
     private func handleDroppedFiles(providers: [NSItemProvider]) -> Bool {
@@ -1412,6 +1494,15 @@ struct WelcomeView: View {
         }
 
         return true
+    }
+
+    private func symbolName(for url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "pdf":
+            return "doc.richtext"
+        default:
+            return "doc.text"
+        }
     }
 }
 

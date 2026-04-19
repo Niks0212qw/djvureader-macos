@@ -32,7 +32,9 @@ extension DateFormatter {
 }
 
 // MARK: - Simple Document State Manager
-class DocumentStateManager: ObservableObject {
+final class DocumentStateManager: ObservableObject {
+    static let shared = DocumentStateManager()
+
     @Published var recentDocuments: [URL] = []
     @Published var lastOpenedDocument: URL?
     
@@ -41,6 +43,7 @@ class DocumentStateManager: ObservableObject {
     
     init() {
         loadState()
+        cleanupMissingDocuments()
     }
     
     func addRecentDocument(_ url: URL) {
@@ -57,6 +60,26 @@ class DocumentStateManager: ObservableObject {
     
     func clearRecentDocuments() {
         recentDocuments.removeAll()
+        lastOpenedDocument = nil
+        saveState()
+    }
+
+    func removeRecentDocument(_ url: URL) {
+        recentDocuments.removeAll { $0 == url }
+        if lastOpenedDocument == url {
+            lastOpenedDocument = recentDocuments.first
+        }
+        saveState()
+    }
+
+    func cleanupMissingDocuments() {
+        recentDocuments.removeAll { !FileManager.default.fileExists(atPath: $0.path) }
+
+        if let lastOpenedDocument,
+           !FileManager.default.fileExists(atPath: lastOpenedDocument.path) {
+            self.lastOpenedDocument = recentDocuments.first
+        }
+
         saveState()
     }
     
